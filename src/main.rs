@@ -1,6 +1,5 @@
 mod core_types;
 use crate::core_types::{Server, NodeState, Command, LogEntry, RequestVoteArgs, RequestVoteReply, AppendEntriesArgs, AppendEntriesReply};
-use std::collections::HashMap;
 
 fn main() {
     println!("\n--- Server/Node Initialization (using modules) ---");
