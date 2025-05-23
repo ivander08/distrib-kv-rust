@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 #[derive(Debug)]
 enum Command {
     Set { key: String, value: String },
@@ -30,5 +32,38 @@ fn main() {
 
     println!("Log Entry 1: {:?}", entry1);
     println!("Log Entry 2: {:?}", entry2);
+    println!("\n--- Simulating a simple Key-Value Store ---");
+
+    let mut kv_store: HashMap<String, String> = HashMap::new();
+
+    if let Command::Set { key, value } = entry1.command {
+        println!("Applying Set: key='{}', value = '{}'", key, value);
+        kv_store.insert(key, value);
+    }
+
+    println!("KV Store after Set: {:?}", kv_store);
+
+    let key_to_get = String::from("my_first_key");
+    match kv_store.get(&key_to_get) {
+        Some(value) => println!("Got value for key '{}': '{}'", key_to_get, value),
+        None => println!("Key '{}' not found.", key_to_get),
+    }
+
+    let entry3_command = Command::Set {
+        key: String::from("another_key"),
+        value: String::from("another value"),
+    };
+
+    if let Command::Set { key, value } = entry3_command {
+        println!("Applying Set: key='{}', value = '{}'", key, value);
+        kv_store.insert(key, value);
+    }
+    
+    println!("KV Store after another Set: {:?}", kv_store);
+
+    let key_to_delete = String::from("my_first_key");
+    kv_store.remove(&key_to_delete);
+    println!("KV Store after deleting '{}': {:?}", key_to_delete, kv_store);
+
 }
 
