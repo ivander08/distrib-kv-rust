@@ -78,7 +78,7 @@ impl Server {
             self.voted_for = None;
         } else if self.state == NodeState::Candidate {
             println!(
-                "Server {}] Candidate in term {} received valid AppendEntries from Leader {}. Becoming Follower.",
+                "[Server {}] Candidate in term {} received valid AppendEntries from Leader {}. Becoming Follower.",
                 self.id, self.current_term, args.leader_id
             );
             self.state = NodeState::Follower;
@@ -119,7 +119,7 @@ impl Server {
 
         // if existing entry conflict with new one, delete and all that follow it, also append new ones
         let mut current_log_index = args.prev_log_index;
-        for (i, new_entry) in args.entries.iter().enumerate() {
+        for new_entry in args.entries.iter() {
             current_log_index += 1;
             let vec_current_log_index = (current_log_index - 1) as usize;
 
@@ -162,41 +162,47 @@ impl Server {
         }
     }
 
-    pub fn apply_commited_entries(&mut self) {
+    pub fn apply_committed_entries(&mut self) {
+        // Corrected spelling
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let vec_index_to_apply = (self.last_applied - 1) as usize;
 
             if vec_index_to_apply < self.log.len() {
-                let log_entry_to_apply = &self.log[vec_index_to_apply];
+                let command_to_apply = self.log[vec_index_to_apply].command.clone();
+
                 println!(
                     "[Server {} Term {}] Applying log index {} to KV store: {:?}",
-                    self.id, self.current_term, self.last_applied, log_entry_to_apply.command
+                    self.id, self.current_term, self.last_applied, command_to_apply
                 );
 
-                match &log_entry_to_apply.command {
+                match command_to_apply {
                     Command::Set { key, value } => {
-                        self.kv_store.insert(key.clone(), value.clone());
+                        self.kv_store.insert(key, value); // No semicolon needed here if it's the last expr in block
                     }
                     Command::Delete { key } => {
-                        self.kv_store.remove(key);
+                        self.kv_store.remove(&key); // remove takes &String, key is owned String here
                     }
-                };
+                }
             } else {
                 eprintln!(
-                    "[Server {}] Error: Trying to apply log index {} but log length is {}.",
+                    "[Server {}] CRITICAL ERROR: Trying to apply log index {} (vec index {}) but log length is {}. Halting application.",
                     self.id,
                     self.last_applied,
+                    vec_index_to_apply,
                     self.log.len()
                 );
-                self.last_applied -= 1;
+                self.last_applied -= 1; // Revert the increment because we couldn't apply
                 break;
             }
         }
-        println!(
-            "[Server {}] KV Store after applying entries: {:?}",
-            self.id, self.kv_store
-        );
+
+        if self.last_applied > 0 {
+            println!(
+                "[Server {}] KV Store after applying entries up to index {}: {:?}",
+                self.id, self.last_applied, self.kv_store
+            );
+        }
     }
 }
 
