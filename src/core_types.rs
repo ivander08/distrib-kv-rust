@@ -48,6 +48,146 @@ impl Server {
             kv_store: HashMap::new(),
         }
     }
+
+    pub fn handle_append_entries(
+        &mut self, 
+        args: AppendEntriesArgs,
+    ) -> AppendEntriesReply {
+        println!(
+            "[Server {} Term {} State {:?}] Received AppendEntries from Leader {} in Term {}",
+            self.id, self.current_term, self.state, args.leader_id, args.term
+        );
+
+        // sender is outdated leader
+        if args.term < self.current_term {
+            println!(
+                "[Server {}] Rejecting AppendEntries: Leader's term {} is old (our term is {})",
+                self.id, args.term, self.current_term
+            );
+            return AppendEntriesReply {
+                term : self.current_term,
+                success: false,
+            }
+        }
+
+        // if newer/equal term, candidate/old leader becomes follower
+        if args.term > self.current_term {
+            println!(
+                "[Server {}] New term {} from leader {}. Updating term and becoming Follower.",
+                self.id, args.term, args.leader_id
+            );
+            self.current_term = args.term;
+            self.state = NodeState::Follower;
+            self.voted_for = None;
+        }   
+        else if self.state == NodeState::Candidate {
+            println!(
+                "Server {}] Candidate in term {} received valid AppendEntries from Leader {}. Becoming Follower.",
+                self.id, self.current_term, args.leader_id
+            );
+            self.state = NodeState::Follower;
+        }
+
+        // reply false if log has no prev_log_index that match prev_log_term
+        if args.prev_log_index > 0 { // if 0 then log is empty/leader send from beginning
+            let vec_prev_log_index = (args.prev_log_index - 1) as usize;
+
+            if vec_prev_log_index >= self.log.len() {
+                println!(
+                    "[Server {}] Rejecting AppendEntries: Log doesn't have entry at prev_log_index {} (our log len is {}). Mismatch.",
+                    self.id, args.prev_log_index, self.log.len()
+                );
+                return AppendEntriesReply {
+                    term: self.current_term,
+                    success: false,
+                };
+            }
+
+            if self.log[vec_prev_log_index].term != args.prev_log_term {
+                println!(
+                    "[Server {}] Rejecting AppendEntries: Term mismatch at prev_log_index {}. Expected term {}, got {}. Mismatch.",
+                    self.id, args.prev_log_index, args.prev_log_term, self.log[vec_prev_log_index].term
+                );
+                return AppendEntriesReply {
+                    term: self.current_term,
+                    success: false,
+                };
+            }
+        }
+
+        // if existing entry conflict with new one, delete and all that follow it, also append new ones
+        let mut current_log_index = args.prev_log_index;
+        for (i, new_entry) in args.entries.iter().enumerate() {
+            current_log_index += 1;
+            let vec_current_log_index = (current_log_index - 1) as usize;
+
+            if vec_current_log_index < self.log.len() {
+                if self.log[vec_current_log_index].term != new_entry.term {
+                    println!(
+                        "[Server {}] Conflict at index {}: existing term {}, new term {}. Truncating log.",
+                        self.id, current_log_index, self.log[vec_current_log_index].term, new_entry.term
+                    );
+                    self.log.truncate(vec_current_log_index);
+                    self.log.push(new_entry.clone());
+                }
+            }
+            else {
+                self.log.push(new_entry.clone());
+            }
+        }
+
+        println!("[Server {}] Log after AppendEntries: {:?}", self.id, self.log);
+
+        // set commit_index = min(leader_commit, index of last new entry)
+        if args.leader_commit > self.commit_index {
+            let last_entry_index_in_our_log = self.log.len() as u64;
+
+            self.commit_index = std::cmp::min(args.leader_commit, last_entry_index_in_our_log);
+            println!(
+                "[Server {}] Updated commit_index to {}",
+                self.id, self.commit_index
+            );
+        }
+
+        AppendEntriesReply {
+            term: self.current_term,
+            success: true,
+        }
+    }
+
+    pub fn apply_commited_entries(&mut self) {
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            let vec_index_to_apply = (self.last_applied - 1) as usize;
+            
+            if vec_index_to_apply < self.log.len() {
+                let log_entry_to_apply = &self.log[vec_index_to_apply];
+                println!(
+                    "[Server {} Term {}] Applying log index {} to KV store: {:?}",
+                    self.id, self.current_term, self.last_applied, log_entry_to_apply.command
+                );
+
+                match &log_entry_to_apply.command {
+                    Command::Set { key, value} => {
+                        self.kv_store.insert(key.clone(), value.clone();)
+                    }
+                    Command::Delete { key } => {
+                        self.kv_store.remove(key);
+                    }
+                }
+                else {
+                    eprintln!(
+                        "[Server {}] Error: Trying to apply log index {} but log length is {}.",
+                        self.id, self.last_applied, self.log.len()
+                    );
+                    self.last_applied -= 1;
+                    break;
+                }
+            }
+            println!("[Server {}] KV Store after applying entries: {:?}", self.id, self.kv_store);
+        }
+    }
+
 }
 
 #[derive(Debug, Clone)]
