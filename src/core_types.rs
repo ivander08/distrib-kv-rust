@@ -33,7 +33,7 @@ pub struct Server {
     pub match_index: HashMap<u64, u64>,
     pub kv_store: HashMap<String, String>,
     pub election_timeout_due: Instant,
-    pub heartbeat_timeout: Duration,
+    pub heartbeat_interval: Duration,
     pub election_timeout_base: Duration,
 }
 
@@ -50,6 +50,35 @@ impl Server {
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             kv_store: HashMap::new(),
+            election_timeout_due: Instant::now() + Self::randomized_election_timeout(election_timeout_base),
+            heartbeat_interval: Duration::from_millis(50),
+            election_timeout_base,
+        }
+    }
+
+    fn randomized_election_timeout(base: Duration) -> Duration {
+        base_duration + Duration::from_millis(base_duration.as_millis() as u64 / 2)
+    }
+
+    pub fn reset_election_timer(&mut self) {
+        self.election_timeout_due = Instant::now() + Self::randomized_election_timeout(self.election_timeout_base);
+        println!("[Server {} Term {}] Election timer reset. Due at: {:?}", self.id, self.current_term, self.election_timeout_due);
+    }
+
+    pub fn tick(&mut self, peers: &[u64]) -> Vec<(u64, RpcMessage)> {
+        let mut messages_to_send = Vec<(u64, RpcMessage)> = Vec::new();
+        let now = Instant::now();
+
+        match self.state {
+            NodeState::Follower => {
+
+            }
+            NodeState::Candidate => {
+
+            }
+            NodeState::Leader => {
+                
+            }
         }
     }
 
@@ -70,6 +99,8 @@ impl Server {
                 success: false,
             };
         }
+
+        self.reset_election_timer();
 
         // if newer/equal term, candidate/old leader becomes follower
         if args.term > self.current_term {
@@ -222,6 +253,9 @@ impl Server {
                 "[Server {}] Rejecting vote: Candidate's term {} is old (our term is {})",
                 self.id, args.term, self.current_term
             );
+        
+            self.reset_election_timer();
+
             return RequestVoteReply {
                 term: self.current_term,
                 vote_granted: false,
@@ -266,6 +300,7 @@ impl Server {
             );
             self.voted_for = Some(args.candidate_id);
             self.state = NodeState::Follower;
+            self.reset_election_timer();
             vote_granted = true;
         } else {
             println!(
