@@ -20,6 +20,44 @@ pub struct LogEntry {
     pub command: Command,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppendEntriesReply {
+    pub term: u64,
+    pub success: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RequestVoteReply {
+    pub term: u64,
+    pub vote_granted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestVoteArgs {
+    pub term: u64,
+    pub candidate_id: u64,
+    pub last_log_index: u64,
+    pub last_log_term: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppendEntriesArgs {
+    pub term: u64,
+    pub leader_id: u64,
+    pub prev_log_index: u64,
+    pub prev_log_term: u64,
+    pub entries: Vec<LogEntry>,
+    pub leader_commit: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum RpcMessage {
+    RequestVote(RequestVoteArgs),
+    RequestVoteReply(RequestVoteReply),
+    AppendEntries(AppendEntriesArgs),
+    AppendEntriesReply(AppendEntriesReply),
+}
+
 #[derive(Debug)]
 pub struct Server {
     pub id: u64,
@@ -39,6 +77,7 @@ pub struct Server {
 
 impl Server {
     pub fn new(id: u64) -> Self {
+        let election_timeout_base = Duration::from_millis(150);
         Server {
             id,
             state: NodeState::Follower,
@@ -50,35 +89,47 @@ impl Server {
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             kv_store: HashMap::new(),
-            election_timeout_due: Instant::now() + Self::randomized_election_timeout(election_timeout_base),
+            election_timeout_due: Instant::now()
+                + Self::randomized_election_timeout(election_timeout_base),
             heartbeat_interval: Duration::from_millis(50),
             election_timeout_base,
         }
     }
 
-    fn randomized_election_timeout(base: Duration) -> Duration {
+    fn randomized_election_timeout(base_duration: Duration) -> Duration {
         base_duration + Duration::from_millis(base_duration.as_millis() as u64 / 2)
     }
 
     pub fn reset_election_timer(&mut self) {
-        self.election_timeout_due = Instant::now() + Self::randomized_election_timeout(self.election_timeout_base);
-        println!("[Server {} Term {}] Election timer reset. Due at: {:?}", self.id, self.current_term, self.election_timeout_due);
+        self.election_timeout_due =
+            Instant::now() + Self::randomized_election_timeout(self.election_timeout_base);
+        println!(
+            "[Server {} Term {}] Election timer reset. Due at: {:?}",
+            self.id, self.current_term, self.election_timeout_due
+        );
     }
 
     pub fn tick(&mut self, peers: &[u64]) -> Vec<(u64, RpcMessage)> {
-        let mut messages_to_send = Vec<(u64, RpcMessage)> = Vec::new();
+        let mut messages_to_send: Vec<(u64, RpcMessage)> = Vec::new();
         let now = Instant::now();
 
         match self.state {
             NodeState::Follower => {
                 if now >= self.election_timeout_due {
-                    println!("[Server {} Term {}] Election timeout! Becoming Candidate.", self.id, self.current_term);
+                    println!(
+                        "[Server {} Term {}] Election timeout! Becoming Candidate.",
+                        self.id, self.current_term
+                    );
                     self.state = NodeState::Candidate;
                 }
             }
             NodeState::Candidate => {
                 if now >= self.election_timeout_due {
-                    println!("[Server {}] Starting new election for Term {}", self.id, self.current_term + 1);
+                    println!(
+                        "[Server {}] Starting new election for Term {}",
+                        self.id,
+                        self.current_term + 1
+                    );
                     self.current_term += 1;
                     self.voted_for = Some(self.id);
                     self.reset_election_timer();
@@ -93,13 +144,16 @@ impl Server {
                                 last_log_index,
                                 last_log_term,
                             };
-                            messages_to_send.push((peer_id, RpcMessage::RequestVote(args)));    
+                            messages_to_send.push((peer_id, RpcMessage::RequestVote(args)));
                         }
                     }
                 }
             }
             NodeState::Leader => {
-                println!("[Server {} Term {}] Leader tick (heartbeat logic TBD).", self.id, self.current_term);
+                println!(
+                    "[Server {} Term {}] Leader tick (heartbeat logic TBD).",
+                    self.id, self.current_term
+                );
             }
         }
 
@@ -107,7 +161,12 @@ impl Server {
         if self.commit_index > self.last_applied {
             self.apply_committed_entries();
             if self.last_applied > old_last_applied {
-                 println!("[Server {}] Applied {} entries. KV store: {:?}", self.id, self.last_applied - old_last_applied, self.kv_store);
+                println!(
+                    "[Server {}] Applied {} entries. KV store: {:?}",
+                    self.id,
+                    self.last_applied - old_last_applied,
+                    self.kv_store
+                );
             }
         }
 
@@ -186,20 +245,20 @@ impl Server {
 
         // if existing entry conflict with new one, delete and all that follow it, also append new ones
         let mut current_log_index = args.prev_log_index;
-        for new_entry in args.entries.iter() {
-            current_log_index += 1;
-            let vec_current_log_index = (current_log_index - 1) as usize;
+        for (entry_idx_in_args, new_entry) in args.entries.iter().enumerate() {
+            let log_idx_for_new_entry = args.prev_log_index + 1 + entry_idx_in_args as u64;
+            let vec_log_idx_for_new_entry = (log_idx_for_new_entry - 1) as usize;
 
-            if vec_current_log_index < self.log.len() {
-                if self.log[vec_current_log_index].term != new_entry.term {
+            if vec_log_idx_for_new_entry < self.log.len() {
+                if self.log[vec_log_idx_for_new_entry].term != new_entry.term {
                     println!(
-                        "[Server {}] Conflict at index {}: existing term {}, new term {}. Truncating log.",
+                        "[Server {}] Conflict at index {}: existing term {}, new entry term {}. Truncating log.",
                         self.id,
-                        current_log_index,
-                        self.log[vec_current_log_index].term,
+                        log_idx_for_new_entry,
+                        self.log[vec_log_idx_for_new_entry].term,
                         new_entry.term
                     );
-                    self.log.truncate(vec_current_log_index);
+                    self.log.truncate(vec_log_idx_for_new_entry);
                     self.log.push(new_entry.clone());
                 }
             } else {
@@ -212,11 +271,9 @@ impl Server {
             self.id, self.log
         );
 
-        // set commit_index = min(leader_commit, index of last new entry)
         if args.leader_commit > self.commit_index {
-            let last_entry_index_in_our_log = self.log.len() as u64;
-
-            self.commit_index = std::cmp::min(args.leader_commit, last_entry_index_in_our_log);
+            let last_idx_in_our_log = self.log.len() as u64;
+            self.commit_index = std::cmp::min(args.leader_commit, last_idx_in_our_log);
             println!(
                 "[Server {}] Updated commit_index to {}",
                 self.id, self.commit_index
@@ -285,7 +342,7 @@ impl Server {
                 "[Server {}] Rejecting vote: Candidate's term {} is old (our term is {})",
                 self.id, args.term, self.current_term
             );
-        
+
             self.reset_election_timer();
 
             return RequestVoteReply {
@@ -303,6 +360,7 @@ impl Server {
             self.current_term = args.term;
             self.state = NodeState::Follower;
             self.voted_for = None;
+            self.reset_election_timer();
         }
 
         let can_grant_vote_based_on_prior_vote = match self.voted_for {
@@ -350,42 +408,4 @@ impl Server {
             vote_granted,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct RequestVoteArgs {
-    pub term: u64,
-    pub candidate_id: u64,
-    pub last_log_index: u64,
-    pub last_log_term: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct RequestVoteReply {
-    pub term: u64,
-    pub vote_granted: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct AppendEntriesArgs {
-    pub term: u64,
-    pub leader_id: u64,
-    pub prev_log_index: u64,
-    pub prev_log_term: u64,
-    pub entries: Vec<LogEntry>,
-    pub leader_commit: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct AppendEntriesReply {
-    pub term: u64,
-    pub success: bool,
-}
-
-#[derive(Debug, Clone)]
-pub enum RpcMessage {
-    RequestVote(RequestVoteArgs),
-    RequestVoteReply(RequestVoteReply),
-    AppendEntries(AppendEntriesArgs),
-    AppendEntriesReply(AppendEntriesReply),
 }
