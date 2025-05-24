@@ -71,15 +71,47 @@ impl Server {
 
         match self.state {
             NodeState::Follower => {
-
+                if now >= self.election_timeout_due {
+                    println!("[Server {} Term {}] Election timeout! Becoming Candidate.", self.id, self.current_term);
+                    self.state = NodeState::Candidate;
+                }
             }
             NodeState::Candidate => {
+                if now >= self.election_timeout_due {
+                    println!("[Server {}] Starting new election for Term {}", self.id, self.current_term + 1);
+                    self.current_term += 1;
+                    self.voted_for = Some(self.id);
+                    self.reset_election_timer();
+                    for &peer_id in peers {
+                        if peer_id != self.id {
+                            let last_log_index = self.log.len() as u64;
+                            let last_log_term = self.log.last().map_or(0, |entry| entry.term);
 
+                            let args = RequestVoteArgs {
+                                term: self.current_term,
+                                candidate_id: self.id,
+                                last_log_index,
+                                last_log_term,
+                            };
+                            messages_to_send.push((peer_id, RpcMessage::RequestVote(args)));    
+                        }
+                    }
+                }
             }
             NodeState::Leader => {
-                
+                println!("[Server {} Term {}] Leader tick (heartbeat logic TBD).", self.id, self.current_term);
             }
         }
+
+        let old_last_applied = self.last_applied;
+        if self.commit_index > self.last_applied {
+            self.apply_committed_entries();
+            if self.last_applied > old_last_applied {
+                 println!("[Server {}] Applied {} entries. KV store: {:?}", self.id, self.last_applied - old_last_applied, self.kv_store);
+            }
+        }
+
+        messages_to_send
     }
 
     pub fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
