@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum NodeState {
@@ -31,6 +32,9 @@ pub struct Server {
     pub next_index: HashMap<u64, u64>,
     pub match_index: HashMap<u64, u64>,
     pub kv_store: HashMap<String, String>,
+    pub election_timeout_due: Instant,
+    pub heartbeat_timeout: Duration,
+    pub election_timeout_base: Duration,
 }
 
 impl Server {
@@ -163,7 +167,6 @@ impl Server {
     }
 
     pub fn apply_committed_entries(&mut self) {
-        // Corrected spelling
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let vec_index_to_apply = (self.last_applied - 1) as usize;
@@ -178,10 +181,10 @@ impl Server {
 
                 match command_to_apply {
                     Command::Set { key, value } => {
-                        self.kv_store.insert(key, value); // No semicolon needed here if it's the last expr in block
+                        self.kv_store.insert(key, value);
                     }
                     Command::Delete { key } => {
-                        self.kv_store.remove(&key); // remove takes &String, key is owned String here
+                        self.kv_store.remove(&key);
                     }
                 }
             } else {
@@ -192,16 +195,92 @@ impl Server {
                     vec_index_to_apply,
                     self.log.len()
                 );
-                self.last_applied -= 1; // Revert the increment because we couldn't apply
+                self.last_applied -= 1;
                 break;
             }
         }
 
-        if self.last_applied > 0 {
+        if self.last_applied > 0 || !self.kv_store.is_empty() {
             println!(
                 "[Server {}] KV Store after applying entries up to index {}: {:?}",
                 self.id, self.last_applied, self.kv_store
             );
+        }
+    }
+
+    pub fn handle_request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
+        println!(
+            "[Server {} Term {} State {:?}] Received RequestVote from Candidate {} in Term {}",
+            self.id, self.current_term, self.state, args.candidate_id, args.term
+        );
+
+        let mut vote_granted = false;
+
+        // candidate term is less than our term, means candidate is outdated
+        if args.term < self.current_term {
+            println!(
+                "[Server {}] Rejecting vote: Candidate's term {} is old (our term is {})",
+                self.id, args.term, self.current_term
+            );
+            return RequestVoteReply {
+                term: self.current_term,
+                vote_granted: false,
+            };
+        }
+
+        // candidate term is greater than our term, we are outdated
+        if args.term > self.current_term {
+            println!(
+                "[Server {}] Candidate {} has newer term {}. Updating my term, becoming Follower, clearing vote.",
+                self.id, args.candidate_id, args.term
+            );
+            self.current_term = args.term;
+            self.state = NodeState::Follower;
+            self.voted_for = None;
+        }
+
+        let can_grant_vote_based_on_prior_vote = match self.voted_for {
+            None => true,
+            Some(voted_candidate_id) => voted_candidate_id == args.candidate_id,
+        };
+
+        let mut our_last_log_term = 0;
+        let mut our_last_log_index = 0;
+        if let Some(last_entry) = self.log.last() {
+            our_last_log_term = last_entry.term;
+            our_last_log_index = self.log.len() as u64;
+        }
+
+        let candidate_log_is_at_least_as_up_to_date = if args.last_log_term > our_last_log_term {
+            true
+        } else if args.last_log_term == our_last_log_term {
+            args.last_log_index >= our_last_log_index
+        } else {
+            false
+        };
+
+        if can_grant_vote_based_on_prior_vote && candidate_log_is_at_least_as_up_to_date {
+            println!(
+                "[Server {}] Granting vote to Candidate {} for Term {}",
+                self.id, args.candidate_id, self.current_term
+            );
+            self.voted_for = Some(args.candidate_id);
+            self.state = NodeState::Follower;
+            vote_granted = true;
+        } else {
+            println!(
+                "[Server {}] Rejecting vote for Candidate {} for Term {}. Prior vote: {:?}, Candidate up-to-date: {}",
+                self.id,
+                args.candidate_id,
+                self.current_term,
+                self.voted_for,
+                candidate_log_is_at_least_as_up_to_date
+            );
+        }
+
+        RequestVoteReply {
+            term: self.current_term,
+            vote_granted,
         }
     }
 }
