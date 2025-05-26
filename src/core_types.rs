@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -73,10 +73,12 @@ pub struct Server {
     pub election_timeout_due: Instant,
     pub heartbeat_interval: Duration,
     pub election_timeout_base: Duration,
+    pub peer_ids: Vec<u64>,
+    pub votes_received: HashSet<u64>,
 }
 
 impl Server {
-    pub fn new(id: u64) -> Self {
+    pub fn new(id: u64, peer_ids: Vec<u64>) -> Self {
         let election_timeout_base = Duration::from_millis(150);
         Server {
             id,
@@ -93,6 +95,8 @@ impl Server {
                 + Self::randomized_election_timeout(election_timeout_base),
             heartbeat_interval: Duration::from_millis(50),
             election_timeout_base,
+            peer_ids,
+            votes_received: HashSet::new(),
         }
     }
 
@@ -407,5 +411,85 @@ impl Server {
             term: self.current_term,
             vote_granted,
         }
+    }
+
+    pub fn handle_request_vote_reply(
+        &mut self,
+        reply: RequestVoteReply,
+        from_peer_id: u64,
+        total_servers: usize,
+    ) -> Option<Vec<(u64, RpcMessage)>> {
+        println!(
+            "[Server {} Term {} State {:?}] Received RequestVoteReply from Peer {} (Term {}, Granted: {})",
+            self.id, self.current_term, self.state, from_peer_id, reply.term, reply.vote_granted
+        );
+
+        if self.state != NodeState::Candidate {
+            println!("[Server {}] Not a candidate, ignoring vote reply.", self.id);
+            return None;
+        }
+
+        if reply.term > self.current_term {
+            println!(
+                "[Server {}] Reply has newer term {}. Updating my term, becoming Follower.",
+                self.id, reply.term
+            );
+            self.current_term = reply.term;
+            self.state = NodeState::Follower;
+            self.voted_for = None;
+            self.votes_received.clear();
+            self.reset_election_timer();
+            return None;
+        }
+
+        if reply.term < self.current_term || self.current_term != reply.term {
+            println!(
+                "[Server {}] Ignoring stale vote reply for term {}.",
+                self.id, reply.term
+            );
+            return None;
+        }
+
+        if reply.vote_granted {
+            self.votes_received.insert(from_peer_id);
+            println!(
+                "[Server {}] Vote granted by {}. Total votes: {}/{}",
+                self.id,
+                from_peer_id,
+                self.votes_received.len(),
+                total_servers
+            );
+
+            let majority_needed = (total_servers / 2) + 1;
+            if self.votes_received.len() >= majority_needed {
+                println!(
+                    "[Server {} Term {}] Won election with {} votes! Becoming LEADER.",
+                    self.id,
+                    self.current_term,
+                    self.votes_received.len()
+                );
+                self.state = NodeState::Leader;
+
+                let mut initial_heartbeats = Vec::new();
+                for &peer_id in &self.peer_ids {
+                    if peer_id != self.id {
+                        self.next_index.insert(peer_id, (self.log.len() + 1) as u64);
+                        self.match_index.insert(peer_id, 0);
+
+                        let args = AppendEntriesArgs {
+                            term: self.current_term,
+                            leader_id: self.id,
+                            prev_log_index: self.log.len() as u64,
+                            prev_log_term: self.log.last().map_or(0, |e| e.term), 
+                            entries: Vec::new(),
+                            leader_commit: self.commit_index,
+                        };
+                        initial_heartbeats.push((peer_id, RpcMessage::AppendEntries(args)));
+                    }
+                }
+                return Some(initial_heartbeats);
+            }
+        }
+        None
     }
 }
