@@ -155,30 +155,29 @@ impl Server {
             }
             NodeState::Leader => {
                 println!("[Server {} Term {}] Leader tick: Sending heartbeats/entries.", self.id, self.current_term);
-                for &peer_id in &self.peer_ids {
-                    if peer.id != self.id {
-                        let next_idx_for_peer = *self.next_index.get(&peer_id).unwrap_or(& ( (self.log.len() + 1) as u64));
+                for &peer_id in &self.peer_ids { 
+                    if peer_id != self.id {
+                        let next_idx_for_peer = *self.next_index.get(&peer_id).unwrap_or(&((self.log.len() + 1) as u64));
                         let prev_log_idx = next_idx_for_peer - 1;
                         let prev_log_term = if prev_log_idx > 0 && (prev_log_idx as usize - 1) < self.log.len() {
-                            self.log[(prev_log_idx as usize - 1)].term
+                            self.log[(prev_log_idx as usize) - 1].term
                         } else {
                             0
                         };
 
-                        let entries_to_send: Vec<LogEntry> = Vec::new();
+                        let entries_to_send: Vec<LogEntry> = Vec::new(); // heartbeat
 
                         let args = AppendEntriesArgs {
                             term: self.current_term,
                             leader_id: self.id,
                             prev_log_index: prev_log_idx,
                             prev_log_term,
-                            entries: entries_to_send, // Empty for heartbeat
+                            entries: entries_to_send,
                             leader_commit: self.commit_index,
                         };
                         messages_to_send.push((peer_id, RpcMessage::AppendEntries(args)));
                     }
                 }
-                self.reset_election_timer();
             }
         }
 
@@ -204,7 +203,6 @@ impl Server {
             self.id, self.current_term, self.state, args.leader_id, args.term
         );
 
-        // sender is outdated leader
         if args.term < self.current_term {
             println!(
                 "[Server {}] Rejecting AppendEntries: Leader's term {} is old (our term is {})",
@@ -218,7 +216,6 @@ impl Server {
 
         self.reset_election_timer();
 
-        // if newer/equal term, candidate/old leader becomes follower
         if args.term > self.current_term {
             println!(
                 "[Server {}] New term {} from leader {}. Updating term and becoming Follower.",
@@ -227,65 +224,47 @@ impl Server {
             self.current_term = args.term;
             self.state = NodeState::Follower;
             self.voted_for = None;
-        } else if self.state == NodeState::Candidate {
-            println!(
+        } else if self.state == NodeState::Candidate && args.term == self.current_term {
+             println!(
                 "[Server {}] Candidate in term {} received valid AppendEntries from Leader {}. Becoming Follower.",
                 self.id, self.current_term, args.leader_id
             );
             self.state = NodeState::Follower;
         }
 
-        // reply false if log has no prev_log_index that match prev_log_term
         if args.prev_log_index > 0 {
-            // if 0 then log is empty/leader send from beginning
             let vec_prev_log_index = (args.prev_log_index - 1) as usize;
-
             if vec_prev_log_index >= self.log.len() {
                 println!(
                     "[Server {}] Rejecting AppendEntries: Log doesn't have entry at prev_log_index {} (our log len is {}). Mismatch.",
-                    self.id,
-                    args.prev_log_index,
-                    self.log.len()
+                    self.id, args.prev_log_index, self.log.len()
                 );
-                return AppendEntriesReply {
-                    term: self.current_term,
-                    success: false,
-                };
+                return AppendEntriesReply { term: self.current_term, success: false };
             }
 
             if self.log[vec_prev_log_index].term != args.prev_log_term {
                 println!(
                     "[Server {}] Rejecting AppendEntries: Term mismatch at prev_log_index {}. Expected term {}, got {}. Mismatch.",
-                    self.id,
-                    args.prev_log_index,
-                    args.prev_log_term,
-                    self.log[vec_prev_log_index].term
+                    self.id, args.prev_log_index, args.prev_log_term, self.log[vec_prev_log_index].term
                 );
-                return AppendEntriesReply {
-                    term: self.current_term,
-                    success: false,
-                };
+                return AppendEntriesReply { term: self.current_term, success: false };
             }
         }
 
-        // if existing entry conflict with new one, delete and all that follow it, also append new ones
-        let mut current_log_index = args.prev_log_index;
-        for (entry_idx_in_args, new_entry) in args.entries.iter().enumerate() {
-            let log_idx_for_new_entry = args.prev_log_index + 1 + entry_idx_in_args as u64;
-            let vec_log_idx_for_new_entry = (log_idx_for_new_entry - 1) as usize;
+        for (entry_offset, new_entry) in args.entries.iter().enumerate() {
+            let log_idx_for_this_entry = args.prev_log_index + 1 + entry_offset as u64;
+            let vec_log_idx_for_this_entry = (log_idx_for_this_entry - 1) as usize;
 
-            if vec_log_idx_for_new_entry < self.log.len() {
-                if self.log[vec_log_idx_for_new_entry].term != new_entry.term {
+            if vec_log_idx_for_this_entry < self.log.len() {
+                if self.log[vec_log_idx_for_this_entry].term != new_entry.term {
                     println!(
                         "[Server {}] Conflict at index {}: existing term {}, new entry term {}. Truncating log.",
-                        self.id,
-                        log_idx_for_new_entry,
-                        self.log[vec_log_idx_for_new_entry].term,
-                        new_entry.term
+                        self.id, log_idx_for_this_entry, self.log[vec_log_idx_for_this_entry].term, new_entry.term
                     );
-                    self.log.truncate(vec_log_idx_for_new_entry);
-                    self.log.push(new_entry.clone());
+                    self.log.truncate(vec_log_idx_for_this_entry);
+                    self.log.push(new_entry.clone()); 
                 }
+
             } else {
                 self.log.push(new_entry.clone());
             }
@@ -318,12 +297,10 @@ impl Server {
 
             if vec_index_to_apply < self.log.len() {
                 let command_to_apply = self.log[vec_index_to_apply].command.clone();
-
                 println!(
                     "[Server {} Term {}] Applying log index {} to KV store: {:?}",
                     self.id, self.current_term, self.last_applied, command_to_apply
                 );
-
                 match command_to_apply {
                     Command::Set { key, value } => {
                         self.kv_store.insert(key, value);
@@ -335,16 +312,12 @@ impl Server {
             } else {
                 eprintln!(
                     "[Server {}] CRITICAL ERROR: Trying to apply log index {} (vec index {}) but log length is {}. Halting application.",
-                    self.id,
-                    self.last_applied,
-                    vec_index_to_apply,
-                    self.log.len()
+                    self.id, self.last_applied, vec_index_to_apply, self.log.len()
                 );
                 self.last_applied -= 1;
                 break;
             }
         }
-
         if self.last_applied > 0 || !self.kv_store.is_empty() {
             println!(
                 "[Server {}] KV Store after applying entries up to index {}: {:?}",
@@ -358,17 +331,13 @@ impl Server {
             "[Server {} Term {} State {:?}] Received RequestVote from Candidate {} in Term {}",
             self.id, self.current_term, self.state, args.candidate_id, args.term
         );
-
         let mut vote_granted = false;
 
-        // candidate term is less than our term, means candidate is outdated
         if args.term < self.current_term {
             println!(
                 "[Server {}] Rejecting vote: Candidate's term {} is old (our term is {})",
                 self.id, args.term, self.current_term
             );
-
-            self.reset_election_timer();
 
             return RequestVoteReply {
                 term: self.current_term,
@@ -376,7 +345,6 @@ impl Server {
             };
         }
 
-        // candidate term is greater than our term, we are outdated
         if args.term > self.current_term {
             println!(
                 "[Server {}] Candidate {} has newer term {}. Updating my term, becoming Follower, clearing vote.",
@@ -385,7 +353,7 @@ impl Server {
             self.current_term = args.term;
             self.state = NodeState::Follower;
             self.voted_for = None;
-            self.reset_election_timer();
+            self.reset_election_timer(); 
         }
 
         let can_grant_vote_based_on_prior_vote = match self.voted_for {
@@ -400,31 +368,28 @@ impl Server {
             our_last_log_index = self.log.len() as u64;
         }
 
-        let candidate_log_is_at_least_as_up_to_date = if args.last_log_term > our_last_log_term {
-            true
-        } else if args.last_log_term == our_last_log_term {
-            args.last_log_index >= our_last_log_index
-        } else {
-            false
-        };
+        let candidate_log_is_at_least_as_up_to_date = 
+            if args.last_log_term > our_last_log_term {
+                true
+            } else if args.last_log_term == our_last_log_term {
+                args.last_log_index >= our_last_log_index
+            } else {
+                false
+            };
 
-        if can_grant_vote_based_on_prior_vote && candidate_log_is_at_least_as_up_to_date {
+        if self.current_term == args.term && can_grant_vote_based_on_prior_vote && candidate_log_is_at_least_as_up_to_date {
             println!(
                 "[Server {}] Granting vote to Candidate {} for Term {}",
                 self.id, args.candidate_id, self.current_term
             );
             self.voted_for = Some(args.candidate_id);
-            self.state = NodeState::Follower;
-            self.reset_election_timer();
+            self.state = NodeState::Follower; 
+            self.reset_election_timer();      
             vote_granted = true;
         } else {
             println!(
-                "[Server {}] Rejecting vote for Candidate {} for Term {}. Prior vote: {:?}, Candidate up-to-date: {}",
-                self.id,
-                args.candidate_id,
-                self.current_term,
-                self.voted_for,
-                candidate_log_is_at_least_as_up_to_date
+                "[Server {}] Rejecting vote for Candidate {} for Term {}. OurTerm ({}) vs ArgsTerm ({}). Prior vote: {:?}, Candidate up-to-date: {}",
+                self.id, args.candidate_id, args.term, self.current_term, args.term, self.voted_for, candidate_log_is_at_least_as_up_to_date
             );
         }
 
@@ -463,10 +428,10 @@ impl Server {
             return None;
         }
 
-        if reply.term < self.current_term || self.current_term != reply.term {
+        if reply.term != self.current_term {
             println!(
-                "[Server {}] Ignoring stale vote reply for term {}.",
-                self.id, reply.term
+                "[Server {}] Ignoring stale vote reply for term {} (our term is {}).",
+                self.id, reply.term, self.current_term
             );
             return None;
         }
@@ -474,22 +439,18 @@ impl Server {
         if reply.vote_granted {
             self.votes_received.insert(from_peer_id);
             println!(
-                "[Server {}] Vote granted by {}. Total votes: {}/{}",
-                self.id,
-                from_peer_id,
-                self.votes_received.len(),
-                total_servers
+                "[Server {}] Vote granted by {}. Total votes for term {}: {}/{}",
+                self.id, from_peer_id, self.current_term, self.votes_received.len(), total_servers
             );
 
             let majority_needed = (total_servers / 2) + 1;
             if self.votes_received.len() >= majority_needed {
                 println!(
                     "[Server {} Term {}] Won election with {} votes! Becoming LEADER.",
-                    self.id,
-                    self.current_term,
-                    self.votes_received.len()
+                    self.id, self.current_term, self.votes_received.len()
                 );
                 self.state = NodeState::Leader;
+                self.votes_received.clear();
 
                 let mut initial_heartbeats = Vec::new();
                 for &peer_id in &self.peer_ids {
@@ -501,7 +462,7 @@ impl Server {
                             term: self.current_term,
                             leader_id: self.id,
                             prev_log_index: self.log.len() as u64,
-                            prev_log_term: self.log.last().map_or(0, |e| e.term), 
+                            prev_log_term: self.log.last().map_or(0, |e| e.term),
                             entries: Vec::new(),
                             leader_commit: self.commit_index,
                         };
