@@ -1,40 +1,41 @@
+use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Serialize)]
 pub enum NodeState {
     Follower,
     Candidate,
     Leader,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     Set { key: String, value: String },
     Delete { key: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     pub term: u64,
     pub command: Command,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppendEntriesReply {
     // reply to da leaders append/heartbeat
     pub term: u64,
     pub success: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestVoteReply {
     // reply to candidate's vote request
     pub term: u64,
     pub vote_granted: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestVoteArgs {
     // sent by candidate to request votes
     pub term: u64,
@@ -43,7 +44,7 @@ pub struct RequestVoteArgs {
     pub last_log_term: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendEntriesArgs {
     // sent by leader to replicate log/heartbeat
     pub term: u64, // da leaders term
@@ -54,7 +55,7 @@ pub struct AppendEntriesArgs {
     pub leader_commit: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RpcMessage {
     RequestVote(RequestVoteArgs),
     RequestVoteReply(RequestVoteReply),
@@ -365,8 +366,8 @@ impl Server {
         &mut self,
         from_peer_id: u64,
         reply: AppendEntriesReply,
-        request_prev_log_index: u64, // sent index
-        request_prev_log_term: u64,  // sent term
+        request_prev_log_index: u64,
+        request_entries_len: usize,
         total_servers: usize,
     ) {
         println!(
