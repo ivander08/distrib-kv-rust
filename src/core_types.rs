@@ -113,7 +113,7 @@ impl Server {
         );
     }
 
-    pub fn tick(&mut self, peers: &[u64]) -> Vec<(u64, RpcMessage)> {
+    pub fn tick(&mut self) -> Vec<(u64, RpcMessage)> {
         let mut messages_to_send: Vec<(u64, RpcMessage)> = Vec::new();
         let now = Instant::now();
 
@@ -129,15 +129,15 @@ impl Server {
             }
             NodeState::Candidate => {
                 if now >= self.election_timeout_due {
-                    println!(
-                        "[Server {}] Starting new election for Term {}",
-                        self.id,
-                        self.current_term + 1
-                    );
+                    println!("[Server {}] Candidate starting/restarting election for Term {}", self.id, self.current_term + 1);
                     self.current_term += 1;
+                    self.state = NodeState::Candidate;
                     self.voted_for = Some(self.id);
+                    self.votes_received.clear();
+                    self.votes_received.insert(self.id);
                     self.reset_election_timer();
-                    for &peer_id in peers {
+
+                    for &peer_id in &self.peer_ids {
                         if peer_id != self.id {
                             let last_log_index = self.log.len() as u64;
                             let last_log_term = self.log.last().map_or(0, |entry| entry.term);
@@ -154,10 +154,31 @@ impl Server {
                 }
             }
             NodeState::Leader => {
-                println!(
-                    "[Server {} Term {}] Leader tick (heartbeat logic TBD).",
-                    self.id, self.current_term
-                );
+                println!("[Server {} Term {}] Leader tick: Sending heartbeats/entries.", self.id, self.current_term);
+                for &peer_id in &self.peer_ids {
+                    if peer.id != self.id {
+                        let next_idx_for_peer = *self.next_index.get(&peer_id).unwrap_or(& ( (self.log.len() + 1) as u64));
+                        let prev_log_idx = next_idx_for_peer - 1;
+                        let prev_log_term = if prev_log_idx > 0 && (prev_log_idx as usize - 1) < self.log.len() {
+                            self.log[(prev_log_idx as usize - 1)].term
+                        } else {
+                            0
+                        };
+
+                        let entries_to_send: Vec<LogEntry> = Vec::new();
+
+                        let args = AppendEntriesArgs {
+                            term: self.current_term,
+                            leader_id: self.id,
+                            prev_log_index: prev_log_idx,
+                            prev_log_term,
+                            entries: entries_to_send, // Empty for heartbeat
+                            leader_commit: self.commit_index,
+                        };
+                        messages_to_send.push((peer_id, RpcMessage::AppendEntries(args)));
+                    }
+                }
+                self.reset_election_timer();
             }
         }
 
@@ -173,7 +194,7 @@ impl Server {
                 );
             }
         }
-
+        
         messages_to_send
     }
 
