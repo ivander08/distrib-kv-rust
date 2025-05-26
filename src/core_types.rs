@@ -128,7 +128,7 @@ impl Server {
                 }
             }
             NodeState::Candidate => {
-                if now >= self.election_timeout_due {
+                if now >= self.election_timeout_due || self.state == NodeState::Candidate { 
                     println!("[Server {}] Candidate starting/restarting election for Term {}", self.id, self.current_term + 1);
                     self.current_term += 1;
                     self.state = NodeState::Candidate;
@@ -154,18 +154,53 @@ impl Server {
                 }
             }
             NodeState::Leader => {
-                println!("[Server {} Term {}] Leader tick: Sending heartbeats/entries.", self.id, self.current_term);
-                for &peer_id in &self.peer_ids { 
+                println!(
+                    "[Server {} Term {}] Leader tick: Preparing AppendEntries.",
+                    self.id, self.current_term
+                );
+                let mut leader_messages_this_tick = Vec::new(); 
+                for &peer_id in &self.peer_ids {
                     if peer_id != self.id {
-                        let next_idx_for_peer = *self.next_index.get(&peer_id).unwrap_or(&((self.log.len() + 1) as u64));
-                        let prev_log_idx = next_idx_for_peer - 1;
-                        let prev_log_term = if prev_log_idx > 0 && (prev_log_idx as usize - 1) < self.log.len() {
-                            self.log[(prev_log_idx as usize) - 1].term
+                        let next_log_idx_to_send = *self
+                            .next_index
+                            .get(&peer_id)
+                            .unwrap_or(&((self.log.len() + 1) as u64));
+                        
+                        let prev_log_idx = next_log_idx_to_send.saturating_sub(1);
+                        let prev_log_term = if prev_log_idx > 0 {
+                            let vec_prev_idx = (prev_log_idx - 1) as usize;
+                            if vec_prev_idx < self.log.len() {
+                                self.log[vec_prev_idx].term
+                            } else {
+                                0
+                            }
                         } else {
-                            0
+                            0 
                         };
 
-                        let entries_to_send: Vec<LogEntry> = Vec::new(); // heartbeat
+                        let mut entries_to_send: Vec<LogEntry> = Vec::new(); 
+
+                        if next_log_idx_to_send <= (self.log.len() as u64) && !self.log.is_empty() {
+                            let start_vec_idx = (next_log_idx_to_send - 1) as usize;
+                            if start_vec_idx < self.log.len() {
+                                entries_to_send = self.log[start_vec_idx..].to_vec();
+                                println!(
+                                    "[Server {} -> S{}] Sending {} entries starting from log index {}",
+                                    self.id, peer_id, entries_to_send.len(), next_log_idx_to_send
+                                );
+                            } else {
+
+                                println!(
+                                    "[Server {} -> S{}] Sending HEARTBEAT (next_idx={} out of bounds for log_len={})",
+                                    self.id, peer_id, next_log_idx_to_send, self.log.len()
+                                );
+                            }
+                        } else {
+                            println!(
+                                "[Server {} -> S{}] Sending HEARTBEAT (no new entries, next_idx={})",
+                                self.id, peer_id, next_log_idx_to_send
+                            );
+                        }
 
                         let args = AppendEntriesArgs {
                             term: self.current_term,
@@ -175,9 +210,10 @@ impl Server {
                             entries: entries_to_send,
                             leader_commit: self.commit_index,
                         };
-                        messages_to_send.push((peer_id, RpcMessage::AppendEntries(args)));
+                        leader_messages_this_tick.push((peer_id, RpcMessage::AppendEntries(args)));
                     }
                 }
+                messages_to_send.extend(leader_messages_this_tick);
             }
         }
 
@@ -241,8 +277,7 @@ impl Server {
                 );
                 return AppendEntriesReply { term: self.current_term, success: false };
             }
-
-            if self.log[vec_prev_log_index].term != args.prev_log_term {
+            if self.log[vec_prev_log_index].term != args.prev_log_term { // Corrected: removed extra parenthesis
                 println!(
                     "[Server {}] Rejecting AppendEntries: Term mismatch at prev_log_index {}. Expected term {}, got {}. Mismatch.",
                     self.id, args.prev_log_index, args.prev_log_term, self.log[vec_prev_log_index].term
@@ -264,7 +299,6 @@ impl Server {
                     self.log.truncate(vec_log_idx_for_this_entry);
                     self.log.push(new_entry.clone()); 
                 }
-
             } else {
                 self.log.push(new_entry.clone());
             }
@@ -287,6 +321,99 @@ impl Server {
         AppendEntriesReply {
             term: self.current_term,
             success: true,
+        }
+    }
+
+    pub fn handle_append_entries_reply(
+        &mut self,
+        from_peer_id: u64,
+        reply: AppendEntriesReply,
+        total_servers: usize,
+    ) {
+        println!(
+            "[Server {} Term {} State {:?}] Received AppendEntriesReply from Peer {} (Term {}, Success: {})",
+            self.id, self.current_term, self.state, from_peer_id, reply.term, reply.success
+        );
+
+        if self.state != NodeState::Leader {
+            println!("[Server {}] Not a Leader, ignoring AppendEntriesReply.", self.id);
+            return;
+        }
+
+        if reply.term > self.current_term {
+            println!(
+                "[Server {}] AppendEntriesReply has newer term {}. Updating my term, becoming Follower.",
+                self.id, reply.term
+            );
+            self.current_term = reply.term;
+            self.state = NodeState::Follower;
+            self.voted_for = None;
+            self.votes_received.clear(); 
+            self.reset_election_timer();
+            return;
+        }
+
+        if reply.term < self.current_term {
+            println!("[Server {}] Ignoring stale AppendEntriesReply from term {}.", self.id, reply.term);
+            return;
+        }
+
+        if reply.success {
+             println!("[Server {}] AppendEntries to S{} was successful.", self.id, from_peer_id);
+
+
+        } else {
+            if let Some(ni) = self.next_index.get_mut(&from_peer_id) {
+                if *ni > 1 {
+                    *ni -= 1;
+                    println!(
+                        "[Server {}] Follower {} rejected. Decrementing its next_index to {}",
+                        self.id, from_peer_id, *ni
+                    );
+                } else {
+                     println!(
+                        "[Server {}] Follower {} rejected. Its next_index is already 1.",
+                        self.id, from_peer_id
+                    );
+                }
+            }
+        }
+        self.try_advance_commit_index(total_servers);
+    }
+
+    fn try_advance_commit_index(&mut self, total_servers: usize) {
+        if self.state != NodeState::Leader {
+            return;
+        }
+        let majority_needed = (total_servers / 2) + 1;
+        let mut new_commit_index = self.commit_index;
+
+        for n_candidate in (self.commit_index + 1)..=(self.log.len() as u64) {
+            let vec_idx = (n_candidate - 1) as usize;
+            if self.log[vec_idx].term == self.current_term {
+                let mut replicated_count = 1;
+                for &peer_id in &self.peer_ids {
+                    if peer_id != self.id {
+                        if *self.match_index.get(&peer_id).unwrap_or(&0) >= n_candidate {
+                            replicated_count += 1;
+                        }
+                    }
+                }
+                if replicated_count >= majority_needed {
+                    new_commit_index = n_candidate;
+                } else {
+                    break;
+                }
+            } else {
+                break; 
+            }
+        }
+        if new_commit_index > self.commit_index {
+            println!(
+                "[Server {}] Leader's commit_index advanced from {} to {}",
+                self.id, self.commit_index, new_commit_index
+            );
+            self.commit_index = new_commit_index;
         }
     }
 
@@ -338,7 +465,6 @@ impl Server {
                 "[Server {}] Rejecting vote: Candidate's term {} is old (our term is {})",
                 self.id, args.term, self.current_term
             );
-
             return RequestVoteReply {
                 term: self.current_term,
                 vote_granted: false,
@@ -376,7 +502,7 @@ impl Server {
             } else {
                 false
             };
-
+        
         if self.current_term == args.term && can_grant_vote_based_on_prior_vote && candidate_log_is_at_least_as_up_to_date {
             println!(
                 "[Server {}] Granting vote to Candidate {} for Term {}",
@@ -450,13 +576,13 @@ impl Server {
                     self.id, self.current_term, self.votes_received.len()
                 );
                 self.state = NodeState::Leader;
-                self.votes_received.clear();
+                self.votes_received.clear(); 
 
                 let mut initial_heartbeats = Vec::new();
-                for &peer_id in &self.peer_ids {
-                    if peer_id != self.id {
-                        self.next_index.insert(peer_id, (self.log.len() + 1) as u64);
-                        self.match_index.insert(peer_id, 0);
+                for &peer_id_target in &self.peer_ids {
+                    if peer_id_target != self.id {
+                        self.next_index.insert(peer_id_target, (self.log.len() + 1) as u64);
+                        self.match_index.insert(peer_id_target, 0);
 
                         let args = AppendEntriesArgs {
                             term: self.current_term,
@@ -466,7 +592,7 @@ impl Server {
                             entries: Vec::new(),
                             leader_commit: self.commit_index,
                         };
-                        initial_heartbeats.push((peer_id, RpcMessage::AppendEntries(args)));
+                        initial_heartbeats.push((peer_id_target, RpcMessage::AppendEntries(args)));
                     }
                 }
                 return Some(initial_heartbeats);
