@@ -21,19 +21,19 @@ pub struct LogEntry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct AppendEntriesReply {
-    pub term: u64,
+pub struct AppendEntriesReply { // reply to da leaders append/heartbeat
+    pub term: u64, 
     pub success: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct RequestVoteReply {
+pub struct RequestVoteReply { // reply to candidate's vote request
     pub term: u64,
     pub vote_granted: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct RequestVoteArgs {
+pub struct RequestVoteArgs { // sent by candidate to request votes
     pub term: u64,
     pub candidate_id: u64,
     pub last_log_index: u64,
@@ -41,11 +41,11 @@ pub struct RequestVoteArgs {
 }
 
 #[derive(Debug, Clone)]
-pub struct AppendEntriesArgs {
-    pub term: u64,
+pub struct AppendEntriesArgs { // sent by leader to replicate log/heartbeat
+    pub term: u64,  // da leaders term
     pub leader_id: u64,
-    pub prev_log_index: u64,
-    pub prev_log_term: u64,
+    pub prev_log_index: u64, // index of log entry immediately preceding new ones
+    pub prev_log_term: u64, // the term of the prev_log_index 
     pub entries: Vec<LogEntry>,
     pub leader_commit: u64,
 }
@@ -67,12 +67,12 @@ pub struct Server {
     pub log: Vec<LogEntry>,
     pub commit_index: u64,
     pub last_applied: u64,
-    pub next_index: HashMap<u64, u64>,
-    pub match_index: HashMap<u64, u64>,
+    pub next_index: HashMap<u64, u64>, // for leader: next log index to send to each peer
+    pub match_index: HashMap<u64, u64>, // for leader: highest log index known replicated on each peer
     pub kv_store: HashMap<String, String>,
     pub election_timeout_due: Instant,
     pub heartbeat_interval: Duration,
-    pub election_timeout_base: Duration,
+    pub election_timeout_base: Duration, // base for randomized election timeout
     pub peer_ids: Vec<u64>,
     pub votes_received: HashSet<u64>,
 }
@@ -104,7 +104,7 @@ impl Server {
         base_duration + Duration::from_millis(base_duration.as_millis() as u64 / 2)
     }
 
-    pub fn reset_election_timer(&mut self) {
+    pub fn reset_election_timer(&mut self) { // call when hearing from leader or starting election
         self.election_timeout_due =
             Instant::now() + Self::randomized_election_timeout(self.election_timeout_base);
         println!(
@@ -119,7 +119,7 @@ impl Server {
 
         match self.state {
             NodeState::Follower => {
-                if now >= self.election_timeout_due {
+                if now >= self.election_timeout_due { // didn't hear from leader
                     println!(
                         "[Server {} Term {}] Election timeout! Becoming Candidate.",
                         self.id, self.current_term
@@ -139,7 +139,7 @@ impl Server {
 
                     for &peer_id in &self.peer_ids {
                         if peer_id != self.id {
-                            let last_log_index = self.log.len() as u64;
+                            let last_log_index = self.log.len() as u64; 
                             let last_log_term = self.log.last().map_or(0, |entry| entry.term);
 
                             let args = RequestVoteArgs {
@@ -161,10 +161,10 @@ impl Server {
                 let mut leader_messages_this_tick = Vec::new(); 
                 for &peer_id in &self.peer_ids {
                     if peer_id != self.id {
-                        let next_log_idx_to_send = *self
+                        let next_log_idx_to_send = *self // what's the next entry this follower needs?
                             .next_index
                             .get(&peer_id)
-                            .unwrap_or(&((self.log.len() + 1) as u64));
+                            .unwrap_or(&((self.log.len() + 1) as u64)); // default is after de last log entry
                         
                         let prev_log_idx = next_log_idx_to_send.saturating_sub(1);
                         let prev_log_term = if prev_log_idx > 0 {
@@ -183,7 +183,7 @@ impl Server {
                         if next_log_idx_to_send <= (self.log.len() as u64) && !self.log.is_empty() {
                             let start_vec_idx = (next_log_idx_to_send - 1) as usize;
                             if start_vec_idx < self.log.len() {
-                                entries_to_send = self.log[start_vec_idx..].to_vec();
+                                entries_to_send = self.log[start_vec_idx..].to_vec(); // clone entries from log
                                 println!(
                                     "[Server {} -> S{}] Sending {} entries starting from log index {}",
                                     self.id, peer_id, entries_to_send.len(), next_log_idx_to_send
@@ -218,7 +218,7 @@ impl Server {
         }
 
         let old_last_applied = self.last_applied;
-        if self.commit_index > self.last_applied {
+        if self.commit_index > self.last_applied { // if new entries committed apply to kv store
             self.apply_committed_entries();
             if self.last_applied > old_last_applied {
                 println!(
@@ -239,7 +239,7 @@ impl Server {
             self.id, self.current_term, self.state, args.leader_id, args.term
         );
 
-        if args.term < self.current_term {
+        if args.term < self.current_term { // leader is outdated
             println!(
                 "[Server {}] Rejecting AppendEntries: Leader's term {} is old (our term is {})",
                 self.id, args.term, self.current_term
@@ -252,7 +252,7 @@ impl Server {
 
         self.reset_election_timer();
 
-        if args.term > self.current_term {
+        if args.term > self.current_term { // new leader/term
             println!(
                 "[Server {}] New term {} from leader {}. Updating term and becoming Follower.",
                 self.id, args.term, args.leader_id
@@ -285,13 +285,13 @@ impl Server {
                 return AppendEntriesReply { term: self.current_term, success: false };
             }
         }
-
-        for (entry_offset, new_entry) in args.entries.iter().enumerate() {
+        
+        for (entry_offset, new_entry) in args.entries.iter().enumerate() { // append entries / handle conflicts
             let log_idx_for_this_entry = args.prev_log_index + 1 + entry_offset as u64;
             let vec_log_idx_for_this_entry = (log_idx_for_this_entry - 1) as usize;
 
-            if vec_log_idx_for_this_entry < self.log.len() {
-                if self.log[vec_log_idx_for_this_entry].term != new_entry.term {
+            if vec_log_idx_for_this_entry < self.log.len() { // if entry exists at this index
+                if self.log[vec_log_idx_for_this_entry].term != new_entry.term { // conflict?
                     println!(
                         "[Server {}] Conflict at index {}: existing term {}, new entry term {}. Truncating log.",
                         self.id, log_idx_for_this_entry, self.log[vec_log_idx_for_this_entry].term, new_entry.term
@@ -309,7 +309,7 @@ impl Server {
             self.id, self.log
         );
 
-        if args.leader_commit > self.commit_index {
+        if args.leader_commit > self.commit_index { // update commit_index based on leaders
             let last_idx_in_our_log = self.log.len() as u64;
             self.commit_index = std::cmp::min(args.leader_commit, last_idx_in_our_log);
             println!(
@@ -340,7 +340,7 @@ impl Server {
             return;
         }
 
-        if reply.term > self.current_term {
+        if reply.term > self.current_term { // oops, we are outdated leader
             println!(
                 "[Server {}] AppendEntriesReply has newer term {}. Updating my term, becoming Follower.",
                 self.id, reply.term
@@ -381,7 +381,7 @@ impl Server {
         self.try_advance_commit_index(total_servers);
     }
 
-    fn try_advance_commit_index(&mut self, total_servers: usize) {
+    fn try_advance_commit_index(&mut self, total_servers: usize) { 
         if self.state != NodeState::Leader {
             return;
         }
@@ -417,7 +417,7 @@ impl Server {
         }
     }
 
-    pub fn apply_committed_entries(&mut self) {
+    pub fn apply_committed_entries(&mut self) { // applyin to kv store
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let vec_index_to_apply = (self.last_applied - 1) as usize;
@@ -530,7 +530,7 @@ impl Server {
         reply: RequestVoteReply,
         from_peer_id: u64,
         total_servers: usize,
-    ) -> Option<Vec<(u64, RpcMessage)>> {
+    ) -> Option<Vec<(u64, RpcMessage)>> { // returns messages if becomes leader
         println!(
             "[Server {} Term {} State {:?}] Received RequestVoteReply from Peer {} (Term {}, Granted: {})",
             self.id, self.current_term, self.state, from_peer_id, reply.term, reply.vote_granted
@@ -541,7 +541,7 @@ impl Server {
             return None;
         }
 
-        if reply.term > self.current_term {
+        if reply.term > self.current_term { // we are outdated
             println!(
                 "[Server {}] Reply has newer term {}. Updating my term, becoming Follower.",
                 self.id, reply.term
@@ -579,7 +579,7 @@ impl Server {
                 self.votes_received.clear(); 
 
                 let mut initial_heartbeats = Vec::new();
-                for &peer_id_target in &self.peer_ids {
+                for &peer_id_target in &self.peer_ids { // send initial heartbeats
                     if peer_id_target != self.id {
                         self.next_index.insert(peer_id_target, (self.log.len() + 1) as u64);
                         self.match_index.insert(peer_id_target, 0);
@@ -595,7 +595,7 @@ impl Server {
                         initial_heartbeats.push((peer_id_target, RpcMessage::AppendEntries(args)));
                     }
                 }
-                return Some(initial_heartbeats);
+                return Some(initial_heartbeats); // signal to send these message
             }
         }
         None
