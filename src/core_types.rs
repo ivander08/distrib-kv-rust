@@ -1,6 +1,7 @@
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
+use rand::Rng;
 
 #[derive(Debug, PartialEq, Clone, Copy, Serialize)]
 pub enum NodeState {
@@ -106,7 +107,8 @@ impl Server {
     }
 
     fn randomized_election_timeout(base_duration: Duration) -> Duration {
-        base_duration + Duration::from_millis(base_duration.as_millis() as u64 / 2)
+        let jitter_ms = rand::thread_rng().gen_range(0..=base_duration.as_millis() as u64);
+        base_duration + Duration::from_millis(jitter_ms)
     }
 
     pub fn reset_election_timer(&mut self) {
@@ -406,36 +408,29 @@ impl Server {
         }
 
         if reply.success {
-            let new_match_index = request_prev_log_index + request_entries_len as u64;
-            self.match_index.insert(from_peer_id, new_match_index);
-            self.next_index.insert(from_peer_id, new_match_index + 1);
+            let new_match_index_for_peer = request_prev_log_index + request_entries_len as u64;
+            self.match_index.insert(from_peer_id, new_match_index_for_peer);
+            self.next_index.insert(from_peer_id, new_match_index_for_peer + 1);
 
             println!(
-                "[Server {}] AppendEntries to S{} successful. Updated match_index={}, next_index={}",
-                self.id,
-                from_peer_id,
-                new_match_index,
-                new_match_index + 1
+                "[Server {}] S{} accepted entries. Updated S{}'s match_index={}, next_index={}", 
+                self.id, from_peer_id, from_peer_id, new_match_index_for_peer, new_match_index_for_peer + 1
             );
         } else {
             if let Some(ni) = self.next_index.get_mut(&from_peer_id) {
-                if *ni > 1 {
-                    *ni = (*ni).saturating_sub(1);
+                if *ni > 0 { // next_index should be >= 1
+                    *ni = (*ni).saturating_sub(1); // decrement, ensuring it doesn't go below 0 (though should be 1)
+                    if *ni == 0 && request_prev_log_index > 0 { // if we decremented from 1 to 0
+                        *ni = 1; // ensure next_index is at least 1
+                    }
                     println!(
-                        "[Server {}] Follower {} rejected. Decrementing its next_index to {}",
+                        "[Server {}] Follower {} rejected AppendEntries. Decrementing its next_index to {}",
                         self.id, from_peer_id, *ni
-                    );
-                } else {
-                    println!(
-                        "[Server {}] Follower {} rejected. Its next_index is already 1.",
-                        self.id, from_peer_id
                     );
                 }
             } else {
-                println!(
-                    "[Server {}] Follower {} rejected. No next_index found, cannot decrement.",
-                    self.id, from_peer_id
-                );
+                // This should not happen if next_index is initialized when a server becomes leader
+                println!("[Server {}] Warning: No next_index found for peer {} on AppendEntries rejection.", self.id, from_peer_id);
             }
         }
         self.try_advance_commit_index(total_servers);
