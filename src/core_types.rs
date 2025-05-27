@@ -64,6 +64,22 @@ pub enum RpcMessage {
     AppendEntriesReply(AppendEntriesReply),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClientRequest {
+    Get { key: String },
+    Set { key: String, value: String },
+    Delete { key: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ClientReply {
+    Value { key: String, value: Option<String> },
+    Success { command_applied_at_log_index: u64 }, 
+    Error { msg: String },
+    LeaderRedirect { leader_id: u64, leader_addr: Option<String> }, 
+}
+
+
 #[derive(Debug)]
 pub struct Server {
     pub id: u64,
