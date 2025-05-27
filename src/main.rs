@@ -558,31 +558,28 @@ async fn handle_raft_connection(
                                     ); 
                                 }
                                 
-                                let mut reply_rpc_message: Option<RpcMessage> = None;
+                                let reply_rpc_message: Option<RpcMessage> = None;
                                 {
                                     let mut server_guard = server_logic_arc.lock().await;
                                     match rpc_message {
                                         RpcMessage::RequestVote(args) => {
-                                            reply_rpc_message = Some(RpcMessage::RequestVoteReply(
-                                                server_guard.handle_request_vote(args)
-                                            ));
+                                            Some(RpcMessage::RequestVoteReply(server_guard.handle_request_vote(args)))
                                         }
                                         RpcMessage::AppendEntries(args) => {
-                                            reply_rpc_message = Some(RpcMessage::AppendEntriesReply(
-                                                server_guard.handle_append_entries(args)
-                                            ));
+                                            Some(RpcMessage::AppendEntriesReply(server_guard.handle_append_entries(args)))
+                                        }
+                                        RpcMessage::InstallSnapshot(args) => {
+                                            Some(RpcMessage::InstallSnapshotReply(
+                                                server_guard.handle_install_snapshot(args)
+                                            ))
                                         }
                                         _ => {
-                                            eprintln!(
-                                                "S{} RAFT_UNEXPECTED_MSG_TYPE from {}: \
-                                                Received reply-type message: {:?}", 
-                                                server_id_context, 
-                                                peer_addr_str, 
-                                                rpc_message
-                                            );
+                                            eprintln!("S{} RAFT_UNEXPECTED_MSG_TYPE from {}: {:?}", 
+                                                server_id_context, peer_addr_str, rpc_message);
+                                            None
                                         }
                                     }
-                                }
+                                };
                                 
                                 if let Some(reply_to_send) = reply_rpc_message {
                                     if DETAILED_LOGS { 
