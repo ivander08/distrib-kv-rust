@@ -62,6 +62,8 @@ pub enum RpcMessage {
     RequestVoteReply(RequestVoteReply),
     AppendEntries(AppendEntriesArgs),
     AppendEntriesReply(AppendEntriesReply),
+    InstallSnapshot(InstallSnapshotArgs),
+    InstallSnapshotReply(InstallSnapshotReply),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +95,29 @@ pub enum ClientReply {
 struct PersistentMetadata {
     current_term: u64,
     voted_for: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Snapshot {
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub data: Vec<u8>, 
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotArgs {
+    pub term: u64,
+    pub leader_id: u64,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub offset: u64,
+    pub data: Vec<u8>,
+    pub done: bool, 
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallSnapshotReply {
+    pub term: u64,
 }
 
 #[derive(Debug)]
