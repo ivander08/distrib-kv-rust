@@ -2,6 +2,7 @@ use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use rand::Rng;
+use tokio::sync::oneshot;
 
 #[derive(Debug, PartialEq, Clone, Copy, Serialize)]
 pub enum NodeState {
@@ -97,6 +98,7 @@ pub struct Server {
     pub election_timeout_base: Duration, // base for randomized election timeout
     pub peer_ids: Vec<u64>,
     pub votes_received: HashSet<u64>,
+    pub pending_client_acks: HashMap<u64, oneshot::Sender<ClientReply>>, // for client requests
 }
 
 impl Server {
@@ -119,6 +121,7 @@ impl Server {
             election_timeout_base,
             peer_ids,
             votes_received: HashSet::new(),
+            pending_client_acks: HashMap::new(),
         }
     }
 
@@ -493,12 +496,13 @@ impl Server {
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let vec_index_to_apply = (self.last_applied - 1) as usize;
+            let current_log_index_being_applied = self.last_applied;
 
             if vec_index_to_apply < self.log.len() {
                 let command_to_apply = self.log[vec_index_to_apply].command.clone();
                 println!(
-                    "[Server {} Term {}] Applying log index {} to KV store: {:?}",
-                    self.id, self.current_term, self.last_applied, command_to_apply
+                    "[S{}:T{}] Applying log idx {} to KV: {:?}",
+                    self.id, self.current_term, current_log_index_being_applied, command_to_apply
                 );
                 match command_to_apply {
                     Command::Set { key, value } => {
@@ -506,6 +510,17 @@ impl Server {
                     }
                     Command::Delete { key } => {
                         self.kv_store.remove(&key);
+                    }
+                }
+
+                if let Some(ack_sender) = self.pending_client_acks.remove(&current_log_index_being_applied) {
+                    let reply = ClientReply::Success {
+                        command_applied_at_log_index: current_log_index_being_applied,
+                    };
+                    if ack_sender.send(reply).is_ok() {
+                        println!("[S{}] Sent commit ACK to client for log idx {}", self.id, current_log_index_being_applied);
+                    } else {
+                        println!("[S{}] Failed to send commit ACK to client for log idx {} (client likely disconnected)", self.id, current_log_index_being_applied);
                     }
                 }
             } else {
