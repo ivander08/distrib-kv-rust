@@ -140,6 +140,10 @@ pub struct Server {
     pub pending_client_acks: HashMap<u64, oneshot::Sender<ClientReply>>,
     metadata_path: String,
     log_path: String,
+    pub snapshot_path: String,
+    pub last_snapshot_index: u64,
+    pub last_snapshot_term: u64,
+    pub snapshotting: bool,
 }
 
 const CORE_DETAILED_LOGS: bool = false;
@@ -707,6 +711,85 @@ impl Server {
                 self.id
             );
         }
+    }
+
+    pub fn should_snapshot(&self) -> bool {
+        self.last_applied - self.last_snapshot_index > 1000
+    }
+
+    pub fn take_snapshot(&mut self) -> std::io::Result<()> {
+        if self.snapshotting {
+            return Ok(())
+        }
+        self.snapshotting = true;
+
+        println!("S{} T{} SNAPSHOT_START: Creating snapshot at index {}", 
+            self.id, self.current_term, self.last_applied);
+
+        let snapshot = Snapshot {
+            last_included_index: self.last_applied,
+            last_included_term: self.log.get((self.last_applied - 1) as usize)
+                .map_or(0, |e| e.term),
+            data: bincode::serialize(&self.kv_store).unwrap(),
+        };
+
+        let temp_path = format!("{}.tmp", self.snapshot_path);
+        {
+            let mut file = File::create(&temp_path)?;
+            bincode::serialize_into(&mut file, &snapshot)?;
+            file.sync_all()?;
+        }
+
+        fs::rename(temp_path, &self.snapshot_path)?;
+
+        self.last_snapshot_index = self.last_applied;
+        self.last_snapshot_term = snapshot.last_included_term;
+        self.snapshotting = false;
+
+        println!("S{} T{} SNAPSHOT_COMPLETE: Saved snapshot for index {}",
+            self.id, self.current_term, self.last_applied);
+        
+        Ok(())
+    }
+
+    pub fn load_snapshot(&mut self) -> std::io::Result<()> {
+        if let Ok(file) = File::open(&self.snapshot_path) {
+            let snapshot: Snapshot = bincode::deserialize_from(file)?;
+            self.kv_store = bincode::deserialize(&snapshot.data).unwrap();
+            self.last_snapshot_index = snapshot.last_included_index;
+            self.last_snapshot_term = snapshot.last_included_term;
+            self.last_applied = snapshot.last_included_index;
+            self.commit_index = snapshot.last_included_index;
+
+            self.log.retain(|entry| {
+                let index = self.log_position_to_index(self.log.iter().position(|x| x == entry).unwrap());
+                index > snapshot.last_included_index
+            });
+        }
+        Ok(())
+    }
+
+    fn log_position_to_index(&self, pos: usize) -> u64 {
+        self.last_snapshot_index + 1 + pos as u64
+    }
+
+    pub fn handle_install_snapshot(&mut self, args: InstallSnapshotArgs) -> InstallSnapshotReply {
+        if args.term < self.current_term {
+            return InstallSnapshotReply { term: self.current_term };
+        }
+
+        if args.done {
+            self.kv_store = bincode::deserialize(&args.data).unwrap();
+            self.last_applied = args.last_included_index;
+            self.commit_index = args.last_included_index;
+
+            self.log.retain(|entry| {
+                let index = self.log_position_to_index(self.log.iter().position(|x| x == entry).unwrap());
+                index > args.last_included_index
+            });
+        }
+
+        InstallSnapshotReply { term: self.current_term }
     }
 
     pub fn tick(&mut self) -> Vec<(u64, RpcMessage)> {
