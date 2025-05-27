@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
 use std::fs::create_dir_all;
 
-const DETAILED_LOGS: bool = false;
+const DETAILED_LOGS: bool = true;
 
 #[derive(Debug, Clone)]
 struct AppendEntriesContext {
@@ -513,7 +513,7 @@ async fn handle_raft_connection(
     _total_servers: usize,
 ) {
     let peer_addr_str = stream.peer_addr().map_or_else(
-        |_| "unknown peer".to_string(), 
+        |_| "unknown peer".to_string(),
         |pa| pa.to_string()
     );
 
@@ -522,44 +522,43 @@ async fn handle_raft_connection(
         match stream.read_exact(&mut len_bytes).await {
             Ok(_) => {
                 let msg_len = u32::from_be_bytes(len_bytes) as usize;
-                if msg_len == 0 { 
-                    if DETAILED_LOGS { 
+                if msg_len == 0 {
+                    if DETAILED_LOGS {
                         println!(
-                            "S{} RAFT_RECV_EMPTY_MSG from {}: Skipping.", 
-                            server_id_context, 
+                            "S{} RAFT_RECV_EMPTY_MSG from {}: Skipping.",
+                            server_id_context,
                             peer_addr_str
-                        ); 
-                    } 
-                    continue; 
+                        );
+                    }
+                    continue;
                 }
-                
+
                 if msg_len > 1_048_576 {
                     eprintln!(
                         "S{} RAFT_MSG_LEN_ERR from {}: \
-                        Message length {} too large. Closing.",
-                        server_id_context, 
-                        peer_addr_str, 
+                         Message length {} too large. Closing.",
+                        server_id_context,
+                        peer_addr_str,
                         msg_len
                     );
                     return;
                 }
-                
+
                 let mut msg_buffer = vec![0u8; msg_len];
                 match stream.read_exact(&mut msg_buffer).await {
                     Ok(_) => {
                         match bincode::deserialize::<RpcMessage>(&msg_buffer) {
                             Ok(rpc_message) => {
-                                if DETAILED_LOGS { 
+                                if DETAILED_LOGS {
                                     println!(
-                                        "S{} RAFT_RECV_MSG from {}: Received {:?})", 
-                                        server_id_context, 
-                                        peer_addr_str, 
+                                        "S{} RAFT_RECV_MSG from {}: Received {:?})",
+                                        server_id_context,
+                                        peer_addr_str,
                                         rpc_message
-                                    ); 
+                                    );
                                 }
-                                
-                                let reply_rpc_message: Option<RpcMessage> = None;
-                                {
+
+                                let reply_rpc_message: Option<RpcMessage> = {
                                     let mut server_guard = server_logic_arc.lock().await;
                                     match rpc_message {
                                         RpcMessage::RequestVote(args) => {
@@ -574,34 +573,34 @@ async fn handle_raft_connection(
                                             ))
                                         }
                                         _ => {
-                                            eprintln!("S{} RAFT_UNEXPECTED_MSG_TYPE from {}: {:?}", 
+                                            eprintln!("S{} RAFT_UNEXPECTED_MSG_TYPE from {}: {:?}",
                                                 server_id_context, peer_addr_str, rpc_message);
                                             None
                                         }
                                     }
                                 };
-                                
+
                                 if let Some(reply_to_send) = reply_rpc_message {
-                                    if DETAILED_LOGS { 
+                                    if DETAILED_LOGS {
                                         println!(
-                                            "S{} RAFT_SEND_REPLY to {}: Sending: {:?}", 
-                                            server_id_context, 
-                                            peer_addr_str, 
+                                            "S{} RAFT_SEND_REPLY to {}: Sending: {:?}",
+                                            server_id_context,
+                                            peer_addr_str,
                                             reply_to_send
-                                        ); 
+                                        );
                                     }
-                                    
+
                                     match bincode::serialize(&reply_to_send) {
                                         Ok(serialized_reply) => {
                                             let reply_len = serialized_reply.len() as u32;
                                             if stream.write_all(&reply_len.to_be_bytes()).await.is_err() ||
-                                               stream.write_all(&serialized_reply).await.is_err() 
+                                               stream.write_all(&serialized_reply).await.is_err()
                                             {
                                                 eprintln!(
                                                     "S{} RAFT_REPLY_SEND_IO_ERR to {}: \
-                                                    Write failed for {:?}",
-                                                    server_id_context, 
-                                                    peer_addr_str, 
+                                                     Write failed for {:?}",
+                                                    server_id_context,
+                                                    peer_addr_str,
                                                     reply_to_send
                                                 );
                                                 return;
@@ -610,52 +609,59 @@ async fn handle_raft_connection(
                                         Err(e) => {
                                             eprintln!(
                                                 "S{} RAFT_REPLY_SER_ERR to {}: \
-                                                Failed to serialize reply {:?}: {:?}",
-                                                server_id_context, 
-                                                peer_addr_str, 
-                                                reply_to_send, 
+                                                 Failed to serialize reply {:?}: {:?}",
+                                                server_id_context,
+                                                peer_addr_str,
+                                                reply_to_send,
                                                 e
                                             );
                                         }
+                                    }
+                                } else {
+                                    if DETAILED_LOGS {
+                                        println!(
+                                            "S{} RAFT_NO_REPLY_GENERATED for msg from {}",
+                                            server_id_context, peer_addr_str
+                                        );
                                     }
                                 }
                             }
                             Err(e) => {
                                 eprintln!(
                                     "S{} RAFT_REQ_DESER_ERR from {}: \
-                                    Failed to deserialize RPC: {:?}",
-                                    server_id_context, 
-                                    peer_addr_str, 
+                                     Failed to deserialize RPC: {:?}",
+                                    server_id_context,
+                                    peer_addr_str,
                                     e
                                 );
                             }
                         }
                     }
-                    Err(e) => { 
+                    Err(e) => {
                         eprintln!(
                             "S{} RAFT_READ_BODY_ERR from {}: \
-                            Failed to read body: {:?}", 
-                            server_id_context, 
-                            peer_addr_str, 
+                             Failed to read body: {:?}",
+                            server_id_context,
+                            peer_addr_str,
                             e
-                        ); 
-                        return; 
+                        );
+                        return;
                     }
                 }
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     println!(
-                        "S{} RAFT_CONN_CLOSED by {}: Connection closed.", 
-                        server_id_context, 
+                        "S{} RAFT_CONN_CLOSED by {}: Connection closed.",
+                        server_id_context,
                         peer_addr_str
                     );
                 } else {
                     eprintln!(
                         "S{} RAFT_READ_LEN_ERR from {}: \
-                        Failed to read length prefix: {:?}", 
-                        server_id_context, 
-                        peer_addr_str, 
+                         Failed to read length prefix: {:?}",
+                        server_id_context,
+                        peer_addr_str,
                         e
                     );
                 }

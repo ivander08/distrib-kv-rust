@@ -134,6 +134,7 @@ pub struct Server {
     pub kv_store: HashMap<String, String>,
     pub election_timeout_due: Instant,
     pub heartbeat_interval: Duration,
+    pub last_heartbeat: Instant,
     pub election_timeout_base: Duration,
     pub peer_ids: Vec<u64>,
     pub votes_received: HashSet<u64>,
@@ -146,11 +147,11 @@ pub struct Server {
     pub snapshotting: bool,
 }
 
-const CORE_DETAILED_LOGS: bool = false;
+const CORE_DETAILED_LOGS: bool = true;
 
 impl Server {
     pub fn new(id: u64, peer_ids: Vec<u64>, metadata_path: String, log_path: String) -> Self {
-        let election_timeout_base = Duration::from_millis(150);
+        let election_timeout_base = Duration::from_millis(1000);
         let initial_due_placeholder =
             Instant::now() + Self::randomized_election_timeout(election_timeout_base);
         let snapshot_path = format!("{}.snap", log_path);
@@ -167,7 +168,8 @@ impl Server {
             match_index: HashMap::new(),
             kv_store: HashMap::new(),
             election_timeout_due: initial_due_placeholder,
-            heartbeat_interval: Duration::from_millis(50),
+            heartbeat_interval: Duration::from_millis(100),
+            last_heartbeat: Instant::now(),
             election_timeout_base,
             peer_ids,
             votes_received: HashSet::new(),
@@ -811,69 +813,62 @@ impl Server {
                 }
             }
             NodeState::Leader => {
-                if CORE_DETAILED_LOGS {
+                // Check if we need to send heartbeats
+                let elapsed = self.last_heartbeat.elapsed();
+                if elapsed >= self.heartbeat_interval {
                     println!(
-                        "S{} T{} LEADER_TICK: Preparing AppendEntries/heartbeats.",
-                        self.id, self.current_term
+                        "S{} T{} LEADER_HEARTBEAT: Sending to all peers (last: {:?}, interval: {:?})",
+                        self.id, self.current_term, self.last_heartbeat, self.heartbeat_interval
                     );
-                }
 
-                for &peer_id in &self.peer_ids {
-                    if peer_id != self.id {
-                        let next_idx = *self
-                            .next_index
-                            .get(&peer_id)
-                            .unwrap_or(&((self.log.len() + 1) as u64));
-
-                        let prev_idx = next_idx.saturating_sub(1);
-                        let prev_term = if prev_idx > 0 {
-                            self.log.get((prev_idx - 1) as usize).map_or(0, |e| e.term)
-                        } else {
-                            0
-                        };
-
-                        let entries: Vec<LogEntry> = if next_idx <= self.log.len() as u64 {
-                            self.log[((next_idx - 1) as usize)..].to_vec()
-                        } else {
-                            Vec::new()
-                        };
-
-                        if CORE_DETAILED_LOGS {
-                            if !entries.is_empty() {
-                                println!(
-                                    "S{} T{} LEADER_SEND_ENTRIES -> S{}: Sending {} entries \
-                                    from log index {}.",
-                                    self.id,
-                                    self.current_term,
-                                    peer_id,
-                                    entries.len(),
-                                    next_idx
-                                );
+                    for &peer_id in &self.peer_ids {
+                        if peer_id != self.id {
+                            let next_idx = *self.next_index.get(&peer_id).unwrap_or(&1);
+                            let prev_idx = next_idx.saturating_sub(1);
+                            let prev_term = if prev_idx > 0 {
+                                self.log.get((prev_idx - 1) as usize).map_or(0, |e| e.term)
                             } else {
-                                println!(
-                                    "S{} T{} LEADER_SEND_HEARTBEAT -> S{}: No new entries \
-                                    (next_idx={}, log_len={}).",
-                                    self.id,
-                                    self.current_term,
-                                    peer_id,
-                                    next_idx,
-                                    self.log.len()
-                                );
-                            }
-                        }
+                                0
+                            };
 
-                        messages_to_send.push((
-                            peer_id,
-                            RpcMessage::AppendEntries(AppendEntriesArgs {
-                                term: self.current_term,
-                                leader_id: self.id,
-                                prev_log_index: prev_idx,
-                                prev_log_term: prev_term,
-                                entries,
-                                leader_commit: self.commit_index,
-                            }),
-                        ));
+                            let entries = if next_idx <= self.log.len() as u64 {
+                                self.log[next_idx as usize..].to_vec()
+                            } else {
+                                Vec::new()
+                            };
+
+                            if CORE_DETAILED_LOGS {
+                                if !entries.is_empty() {
+                                    println!(
+                                        "S{} T{} SENDING_ENTRIES -> S{}: {} entries from idx {}",
+                                        self.id,
+                                        self.current_term,
+                                        peer_id,
+                                        entries.len(),
+                                        next_idx
+                                    );
+                                } else {
+                                    println!(
+                                        "S{} T{} SENDING_HEARTBEAT -> S{}",
+                                        self.id, self.current_term, peer_id
+                                    );
+                                }
+                            }
+
+                            messages_to_send.push((
+                                peer_id,
+                                RpcMessage::AppendEntries(AppendEntriesArgs {
+                                    term: self.current_term,
+                                    leader_id: self.id,
+                                    prev_log_index: prev_idx,
+                                    prev_log_term: prev_term,
+                                    entries,
+                                    leader_commit: self.commit_index,
+                                }),
+                            ));
+                        }
                     }
+                    self.last_heartbeat = Instant::now();
                 }
             }
         }
@@ -1327,21 +1322,16 @@ impl Server {
     ) -> Option<Vec<(u64, RpcMessage)>> {
         if CORE_DETAILED_LOGS {
             println!(
-                "S{} T{} RV_REPLY_RECV from P{}(T{}): state={:?}, granted={}",
-                self.id,
-                self.current_term,
-                from_peer_id,
-                reply.term,
-                self.state,
-                reply.vote_granted
+                "S{} T{} RV_REPLY from P{}(T{}): granted={}",
+                self.id, self.current_term, from_peer_id, reply.term, reply.vote_granted
             );
         }
 
         if self.state != NodeState::Candidate {
             if CORE_DETAILED_LOGS {
                 println!(
-                    "S{} T{} RV_REPLY_IGNORE_NOT_CANDIDATE from P{}.",
-                    self.id, self.current_term, from_peer_id
+                    "S{} T{} IGNORE_VOTE_REPLY: Not candidate anymore",
+                    self.id, self.current_term
                 );
             }
             return None;
@@ -1349,82 +1339,68 @@ impl Server {
 
         if reply.term > self.current_term {
             println!(
-                "S{} T{} TERM_UPDATE_RV_REPLY from P{}(T{}): Newer term. Becoming Follower.",
-                self.id, self.current_term, from_peer_id, reply.term
+                "S{} T{} STEPPING_DOWN: Newer term {} from P{}",
+                self.id, self.current_term, reply.term, from_peer_id
             );
             self.current_term = reply.term;
             self.state = NodeState::Follower;
             self.voted_for = None;
-            self.votes_received.clear();
             self.save_metadata();
             self.reset_election_timer();
             return None;
         }
 
-        if reply.term < self.current_term {
-            if CORE_DETAILED_LOGS {
-                println!(
-                    "S{} T{} RV_REPLY_IGNORE_STALE_TERM from P{}(T{}).",
-                    self.id, self.current_term, from_peer_id, reply.term
-                );
-            }
-            return None;
-        }
-
         if reply.vote_granted {
             self.votes_received.insert(from_peer_id);
+
             println!(
-                "S{} T{} RV_REPLY_VOTE_TALLY by P{}: Vote granted. Total votes {}/{}.",
+                "S{} T{} VOTE_COUNT: {}/{}",
                 self.id,
                 self.current_term,
-                from_peer_id,
                 self.votes_received.len(),
-                total_servers
+                (total_servers / 2) + 1
             );
 
-            if self.votes_received.len() >= (total_servers / 2) + 1 {
+            if self.votes_received.len() > total_servers / 2 {
                 println!(
-                    "S{} T{} ELECTION_WON: Won election with {} votes! Becoming LEADER.",
+                    "S{} T{} ELECTED_LEADER: With {} votes",
                     self.id,
                     self.current_term,
                     self.votes_received.len()
                 );
-                self.state = NodeState::Leader;
-                let last_log_idx = self.log.len() as u64;
-                let last_log_term = self.log.last().map_or(0, |e| e.term);
 
+                self.state = NodeState::Leader;
+                self.last_heartbeat = Instant::now(); 
+
+                let last_log_idx = self.log.len() as u64;
                 self.peer_ids
                     .iter()
                     .filter(|&&p| p != self.id)
-                    .for_each(|&p_id| {
-                        self.next_index.insert(p_id, last_log_idx + 1);
-                        self.match_index.insert(p_id, 0);
+                    .for_each(|&p| {
+                        self.next_index.insert(p, last_log_idx + 1);
+                        self.match_index.insert(p, 0);
                     });
 
-                return Some(
-                    self.peer_ids
-                        .iter()
-                        .filter_map(|&p_id| {
-                            if p_id != self.id {
-                                Some((
-                                    p_id,
-                                    RpcMessage::AppendEntries(AppendEntriesArgs {
-                                        term: self.current_term,
-                                        leader_id: self.id,
-                                        prev_log_index: last_log_idx,
-                                        prev_log_term: last_log_term,
-                                        entries: Vec::new(),
-                                        leader_commit: self.commit_index,
-                                    }),
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect(),
-                );
+                let mut messages = Vec::new();
+                for &peer_id in &self.peer_ids {
+                    if peer_id != self.id {
+                        messages.push((
+                            peer_id,
+                            RpcMessage::AppendEntries(AppendEntriesArgs {
+                                term: self.current_term,
+                                leader_id: self.id,
+                                prev_log_index: last_log_idx,
+                                prev_log_term: self.log.last().map_or(0, |e| e.term),
+                                entries: Vec::new(),
+                                leader_commit: self.commit_index,
+                            }),
+                        ));
+                    }
+                }
+                return Some(messages);
             }
         }
+
         None
     }
 }
