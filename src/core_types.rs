@@ -2,16 +2,10 @@ use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use rand::Rng;
-use tokio::sync::oneshot; // Assuming this is needed for ClientReply if Server is in this file
-
-// Add this if you want to control detailed logs from here too
-// Otherwise, main.rs's DETAILED_LOGS won't be in scope unless Server is a submodule of main.
-// For simplicity, let's assume detailed logs here are always on or you manage it differently.
-// Or, pass the DETAILED_LOGS flag into methods if necessary.
-// For now, I will assume some logs are inherently detailed and might be commented out if too noisy.
-
-// ... (Your existing structs: NodeState, Command, LogEntry, etc.) ...
-// These should be defined above or in scope. I'll re-paste them for completeness of this file.
+use tokio::sync::oneshot; 
+use std::fs::{File, OpenOptions};
+use std::io::{Write, Read, Seek, SeekFrom};
+use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Clone, Copy, Serialize)]
 pub enum NodeState {
@@ -87,6 +81,11 @@ pub enum ClientReply {
     LeaderRedirect { leader_id: u64, leader_addr: Option<String> },
 }
 
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct PersistentMetadata {
+    current_term: u64,
+    voted_for: Option<u64>,
+}
 
 #[derive(Debug)]
 pub struct Server {
@@ -108,14 +107,120 @@ pub struct Server {
     pub pending_client_acks: HashMap<u64, oneshot::Sender<ClientReply>>,
 }
 
-const CORE_DETAILED_LOGS: bool = false; // Local flag for this file's detailed logs
+const CORE_DETAILED_LOGS: bool = false;
 
 impl Server {
+    fn get_metadata_path(&self) -> PathBuf {
+        PathBuf::from(format!("data_S{}/metadata.bin", self.id))
+    }
+
+    fn get_log_path(&self) -> PathBuf {
+        PathBuf::from(format!("data_S{}/log.dat", self.id))
+    }
+    fn persist_metadata(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let metadata_path = self.get_metadata_path();
+        if let Some(parent) = metadata_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let data = PersistentMetadata {
+            current_term: self.current_term,
+            voted_for: self.voted_for,
+        };
+        let encoded = bincode::serialize(&data)?;
+
+        let temp_metadata_path = metadata_path.with_extension("tmp");
+        let mut file = File::create(&temp_metadata_path)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?; 
+        std::fs::rename(&temp_metadata_path, &metadata_path)?;
+
+        if CORE_DETAILED_LOGS {
+            println!("S{} T{} PERSIST_META_OK: term={}, voted_for={:?}", self.id, self.current_term, self.current_term, self.voted_for);
+        }
+        Ok(())
+    }
+
+    fn persist_log(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let log_path = self.get_log_path();
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let encoded = bincode::serialize(&self.log)?;
+
+        let temp_log_path = log_path.with_extension("tmp");
+        let mut file = File::create(&temp_log_path)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?; 
+        std::fs::rename(&temp_log_path, &log_path)?;
+
+        if CORE_DETAILED_LOGS {
+             println!("S{} T{} PERSIST_LOG_OK: log_len={}", self.id, self.current_term, self.log.len());
+        }
+        Ok(())
+    }
+    
     pub fn new(id: u64, peer_ids: Vec<u64>) -> Self {
         let election_timeout_base = Duration::from_millis(150);
         let initial_due = Instant::now() + Self::randomized_election_timeout(election_timeout_base);
-        println!("S{} NEW: Server created. Election timeout base: {:?}, first due: {:?}",
-                 id, election_timeout_base, initial_due);
+
+        let metadata_path = PathBuf::from(format!("data_S{}/metadata.bin", id));
+        let log_path = PathBuf::from(format!("data_S{}/log.dat", id));
+
+        let mut loaded_term = 0;
+        let mut loaded_voted_for = None;
+        let mut loaded_log: Vec<LogEntry> = Vec::new();
+
+        if metadata_path.exists() {
+            match File::open(&metadata_path) {
+                Ok(mut file) => {
+                    let mut buffer = Vec::new();
+                    if file.read_to_end(&mut buffer).is_ok() {
+                        if let Ok(metadata) = bincode::deserialize::<PersistentMetadata>(&buffer) {
+                            loaded_term = metadata.current_term;
+                            loaded_voted_for = metadata.voted_for;
+                            println!("S{} NEW_LOAD_META_OK: Loaded term={}, voted_for={:?}", id, loaded_term, loaded_voted_for);
+                        } else {
+                            eprintln!("S{} NEW_LOAD_META_ERR: Failed to deserialize metadata from {:?}. Using defaults.", id, metadata_path);
+                        }
+                    } else {
+                         eprintln!("S{} NEW_LOAD_META_ERR: Failed to read metadata from {:?}. Using defaults.", id, metadata_path);
+                    }
+                }
+                Err(e) => eprintln!("S{} NEW_LOAD_META_ERR: Failed to open metadata file {:?}: {}. Using defaults.", id, metadata_path, e),
+            }
+        } else {
+            println!("S{} NEW_LOAD_META_INFO: No metadata file found at {:?}. Starting fresh.", id, metadata_path);
+        }
+
+        if log_path.exists() {
+            match File::open(&log_path) {
+                Ok(mut file) => {
+                    let mut buffer = Vec::new();
+                    if file.read_to_end(&mut buffer).is_ok() {
+                        if let Ok(log) = bincode::deserialize::<Vec<LogEntry>>(&buffer) {
+                            loaded_log = log;
+                            println!("S{} NEW_LOAD_LOG_OK: Loaded log with {} entries.", id, loaded_log.len());
+                        } else {
+                             eprintln!("S{} NEW_LOAD_LOG_ERR: Failed to deserialize log from {:?}. Using empty log.", id, log_path);
+                        }
+                    } else {
+                        eprintln!("S{} NEW_LOAD_LOG_ERR: Failed to read log from {:?}. Using empty log.", id, log_path);
+                    }
+                }
+                Err(e) => eprintln!("S{} NEW_LOAD_LOG_ERR: Failed to open log file {:?}: {}. Using empty log.", id, log_path, e),
+            }
+        } else {
+            println!("S{} NEW_LOAD_LOG_INFO: No log file found at {:?}. Starting fresh.", id, log_path);
+        }
+
+        let initial_due = Instant::now() + Self::randomized_election_timeout(election_timeout_base);
+        println!(
+            "S{} NEW: Server created/loaded. Term={}, LogLen={}, ElectionTOBase: {:?}, InitialDue: {:?}",
+            id, loaded_term, loaded_log.len(), election_timeout_base, initial_due
+        );
+        
         Server {
             id,
             state: NodeState::Follower,
