@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, oneshot};
 
 #[derive(Debug, Clone)]
 struct AppendEntriesContext {
@@ -372,23 +372,20 @@ async fn run_server(
     }
 }
 
-// Renamed original handle_connection to handle_raft_connection
 async fn handle_raft_connection(
     mut stream: TcpStream,
     server_id_context: u64,
     server_logic_arc: Arc<Mutex<Server>>,
-    total_servers: usize, // This was already passed, good
+    total_servers: usize,
 ) {
     let peer_addr = stream
         .peer_addr()
         .unwrap_or_else(|_| "unknown peer".parse().unwrap());
-    // println!("[S{}] Raft connection handler for: {:?}", server_id_context, peer_addr); // Redundant with accept log
 
     loop {
         let mut len_bytes = [0u8; 4];
         match stream.read_exact(&mut len_bytes).await {
             Ok(_) => {
-                /* ... same as your existing handle_connection for reading/deserializing RPCs ... */
                 let msg_len = u32::from_be_bytes(len_bytes) as usize;
                 if msg_len == 0 {
                     continue;
@@ -402,17 +399,15 @@ async fn handle_raft_connection(
                     Ok(_) => {
                         match bincode::deserialize::<RpcMessage>(&msg_buffer) {
                             Ok(rpc_message) => {
-                                // println!("[S{}] Raft Deserialized: {:?}", server_id_context, rpc_message);
                                 let mut reply_rpc_message: Option<RpcMessage> = None;
                                 let mut ae_context_for_handler: Option<AppendEntriesContext> = None;
 
                                 if let RpcMessage::AppendEntries(ref args_ref) = rpc_message {
                                     ae_context_for_handler = Some(AppendEntriesContext {
-                                        prev_log_index_sent: args_ref.prev_log_index, // This context is for what the *sender* sent,
-                                        entries_len_sent: args_ref.entries.len(), // not directly used by handle_append_entries itself here.
-                                    }); // It's more for the sender when it gets a reply.
-                                } // This seems like a slight mix-up of where context is needed.
-                                // handle_append_entries_reply needs it.
+                                        prev_log_index_sent: args_ref.prev_log_index, 
+                                        entries_len_sent: args_ref.entries.len(), 
+                                    }); 
+                                } 
 
                                 let mut server_guard = server_logic_arc.lock().await;
 
@@ -492,142 +487,165 @@ async fn handle_raft_connection(
     }
 }
 
-// --- New function to handle client connections ---
 async fn handle_client_connection(
     mut stream: TcpStream,
-    server_id_context: u64, // Leader's ID
+    server_id_context: u64, // leader's id, for logging
     server_logic_arc: Arc<Mutex<Server>>,
 ) {
     let peer_addr = stream
         .peer_addr()
         .unwrap_or_else(|_| "unknown client".parse().unwrap());
     println!(
-        "[S{}] Client connection handler for: {:?}",
+        "[s{}] client connection handler for: {:?}",
         server_id_context, peer_addr
     );
 
-    loop {
+    loop { // handle multiple requests on same client connection
         let mut len_bytes = [0u8; 4];
-        match stream.read_exact(&mut len_bytes).await {
+        match stream.read_exact(&mut len_bytes).await { // read msg length
             Ok(_) => {
                 let msg_len = u32::from_be_bytes(len_bytes) as usize;
                 if msg_len == 0 || msg_len > 1_048_576 {
-                    /* handle error or empty */
+                    eprintln!("[s{}] invalid msg_len {} from client {:?}", server_id_context, msg_len, peer_addr);
                     return;
                 }
 
                 let mut msg_buffer = vec![0u8; msg_len];
                 if stream.read_exact(&mut msg_buffer).await.is_err() {
+                    eprintln!("[s{}] failed to read client msg body from {:?}", server_id_context, peer_addr);
                     return;
                 }
 
-                match bincode::deserialize::<ClientRequest>(&msg_buffer) {
+                match bincode::deserialize::<ClientRequest>(&msg_buffer) { // deserialize to ClientRequest
                     Ok(client_request) => {
-                        println!(
-                            "[S{}] Client Deserialized: {:?}",
-                            server_id_context, client_request
-                        );
+                        println!("[s{}] client deserialized: {:?}", server_id_context, client_request);
 
-                        let mut server_guard = server_logic_arc.lock().await;
-                        let mut client_reply_payload: Option<ClientReply> = None;
+                        let mut eventual_client_reply: Option<ClientReply> = None;
+                        
+                        match client_request {
+                            ClientRequest::Set { key, value } => {
+                                let (tx, rx) = oneshot::channel::<ClientReply>();
+                                let mut opt_log_idx_for_cleanup: Option<u64> = None; // use option for log index
 
-                        if server_guard.state != NodeState::Leader {
-                            // Not leader, find out who is if known (simplified)
-                            // For now, just tell client we are not the leader.
-                            // A real implementation might look up the known leader from its state.
-                            client_reply_payload = Some(ClientReply::Error {
-                                msg: "Not the leader".to_string(),
-                            });
-                            println!("[S{}] Not leader, telling client.", server_id_context);
-                        } else {
-                            // Is Leader, process request
-                            match client_request {
-                                ClientRequest::Set { key, value } => {
-                                    println!(
-                                        "[S{}] Leader received SET: k='{}', v='{}'",
-                                        server_id_context, key, value
-                                    );
-                                    let command = Command::Set { key, value };
-                                    let log_entry = LogEntry {
-                                        term: server_guard.current_term,
-                                        command,
-                                    };
-                                    server_guard.log.push(log_entry);
-                                    let new_log_index = server_guard.log.len() as u64;
-                                    println!(
-                                        "[S{}] Leader appended to own log at index {}. Log len: {}",
-                                        server_guard.id,
-                                        new_log_index,
-                                        server_guard.log.len()
-                                    );
-                                    // Replication will happen via tick. Client waits.
-                                    // TODO: Implement waiting for commit before replying to client.
-                                    // For now, reply optimistically or after local append.
-                                    // Let's reply "Command Proposed" - actual commit confirmation is harder.
-                                    client_reply_payload = Some(ClientReply::Success {
-                                        command_applied_at_log_index: new_log_index,
-                                    });
-                                }
-                                ClientRequest::Get { key } => {
-                                    println!(
-                                        "[S{}] Leader received GET: k='{}'",
-                                        server_id_context, key
-                                    );
-                                    let value = server_guard.kv_store.get(&key).cloned(); // Clone to own the String
-                                    client_reply_payload = Some(ClientReply::Value { key, value });
-                                }
-                                ClientRequest::Delete { key } => {
-                                    println!(
-                                        "[S{}] Leader received DELETE: k='{}'",
-                                        server_id_context, key
-                                    );
-                                    let command = Command::Delete { key };
-                                    let log_entry = LogEntry {
-                                        term: server_guard.current_term,
-                                        command,
-                                    };
-                                    server_guard.log.push(log_entry);
-                                    let new_log_index = server_guard.log.len() as u64;
-                                    // TODO: Wait for commit
-                                    client_reply_payload = Some(ClientReply::Success {
-                                        command_applied_at_log_index: new_log_index,
-                                    });
+                                { // limit mutex guard scope
+                                    let mut server_guard = server_logic_arc.lock().await;
+                                    if server_guard.state != NodeState::Leader {
+                                        eventual_client_reply = Some(ClientReply::Error { msg: "not the leader".to_string() });
+                                        println!("[s{}] not leader, telling client.", server_id_context);
+                                    } else {
+                                        println!("[s{}] leader received set: k='{}'", server_guard.id, key);
+                                        let command = Command::Set { key, value };
+                                        let log_entry = LogEntry { term: server_guard.current_term, command };
+                                        server_guard.log.push(log_entry);
+                                        let new_log_index = server_guard.log.len() as u64;
+                                        opt_log_idx_for_cleanup = Some(new_log_index); // store for potential cleanup
+                                        server_guard.pending_client_acks.insert(new_log_index, tx);
+                                        println!("[s{}] leader appended set to own log at index {}. awaiting commit...", server_guard.id, new_log_index);
+                                    }
+                                } // server_guard (mutex lock) is dropped here
+
+                                if eventual_client_reply.is_none() { // means we are leader and waiting
+                                    if let Some(log_idx) = opt_log_idx_for_cleanup { // only proceed if log_idx was set
+                                        println!("[s{}] client handler for log {} waiting for commit signal...", server_id_context, log_idx);
+                                        match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                                            Ok(Ok(committed_reply)) => {
+                                                eventual_client_reply = Some(committed_reply);
+                                            }
+                                            Ok(Err(_channel_closed_err)) => {
+                                                eventual_client_reply = Some(ClientReply::Error { msg: "command processing aborted (channel closed)".to_string() });
+                                                eprintln!("[s{}] oneshot channel closed for log_idx {} before ack.", server_id_context, log_idx);
+                                            }
+                                            Err(_timeout_err) => {
+                                                eventual_client_reply = Some(ClientReply::Error { msg: "command timed out waiting for commit".to_string() });
+                                                eprintln!("[s{}] timeout waiting for commit ack for log_idx {}", server_id_context, log_idx);
+                                                let mut server_guard_cleanup = server_logic_arc.lock().await;
+                                                server_guard_cleanup.pending_client_acks.remove(&log_idx); // use the captured log_idx
+                                                // drop(server_guard_cleanup) happens automatically
+                                            }
+                                        }
+                                    } else {
+                                        // this case should not be reached if eventual_client_reply was None, implies non-leader path already set it
+                                    }
                                 }
                             }
-                        }
-                        drop(server_guard); // Release lock
+                            ClientRequest::Delete { key } => {
+                                let (tx, rx) = oneshot::channel::<ClientReply>();
+                                let mut opt_log_idx_for_cleanup: Option<u64> = None;
 
-                        if let Some(reply) = client_reply_payload {
-                            match bincode::serialize(&reply) {
+                                {
+                                    let mut server_guard = server_logic_arc.lock().await;
+                                    if server_guard.state != NodeState::Leader {
+                                        eventual_client_reply = Some(ClientReply::Error { msg: "not the leader".to_string() });
+                                    } else {
+                                        println!("[s{}] leader received delete: k='{}'", server_guard.id, key);
+                                        let command = Command::Delete { key }; 
+                                        let log_entry = LogEntry { term: server_guard.current_term, command };
+                                        server_guard.log.push(log_entry);
+                                        let new_log_index = server_guard.log.len() as u64;
+                                        opt_log_idx_for_cleanup = Some(new_log_index);
+                                        server_guard.pending_client_acks.insert(new_log_index, tx);
+                                        println!("[s{}] leader appended delete to own log at index {}. awaiting commit...", server_guard.id, new_log_index);
+                                    }
+                                }
+
+                                if eventual_client_reply.is_none() {
+                                    if let Some(log_idx) = opt_log_idx_for_cleanup {
+                                        println!("[s{}] client handler for delete log {} waiting for commit signal...", server_id_context, log_idx);
+                                        match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                                            Ok(Ok(committed_reply)) => eventual_client_reply = Some(committed_reply),
+                                            Ok(Err(_)) => eventual_client_reply = Some(ClientReply::Error { msg: "command processing aborted (channel closed)".to_string() }),
+                                            Err(_) => {
+                                                eventual_client_reply = Some(ClientReply::Error { msg: "command timed out waiting for commit".to_string() });
+                                                let mut server_guard_cleanup = server_logic_arc.lock().await;
+                                                server_guard_cleanup.pending_client_acks.remove(&log_idx);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            ClientRequest::Get { key } => {
+                                let mut server_guard = server_logic_arc.lock().await;
+                                if server_guard.state != NodeState::Leader {
+                                    eventual_client_reply = Some(ClientReply::Error { msg: "not the leader".to_string() });
+                                } else {
+                                    println!("[s{}] leader received get: k='{}'", server_guard.id, key);
+                                    let value = server_guard.kv_store.get(&key).cloned();
+                                    eventual_client_reply = Some(ClientReply::Value { key, value });
+                                }
+                                // server_guard dropped here
+                            }
+                        }
+                        
+                        if let Some(reply) = eventual_client_reply { // ensure reply is always handled
+                             match bincode::serialize(&reply) {
                                 Ok(serialized_reply) => {
                                     let len = serialized_reply.len() as u32;
-                                    if stream.write_all(&len.to_be_bytes()).await.is_err() {
-                                        return;
+                                    if stream.write_all(&len.to_be_bytes()).await.is_err() { 
+                                        eprintln!("[s{}] client reply: send len failed to {:?}", server_id_context, peer_addr);
+                                        return; 
                                     }
-                                    if stream.write_all(&serialized_reply).await.is_err() {
-                                        return;
+                                    if stream.write_all(&serialized_reply).await.is_err() { 
+                                        eprintln!("[s{}] client reply: send body failed to {:?}", server_id_context, peer_addr);
+                                        return; 
                                     }
-                                    println!(
-                                        "[S{}] Client reply sent: {:?}",
-                                        server_id_context, reply
-                                    );
+                                     println!("[s{}] client reply sent to {:?}: {:?}", server_id_context, peer_addr, reply);
                                 }
-                                Err(e) => eprintln!(
-                                    "[S{}] Failed to serialize client reply: {:?}",
-                                    server_id_context, e
-                                ),
+                                Err(e) => eprintln!("[s{}] failed to serialize client reply: {:?}", server_id_context, e),
                             }
+                        } else {
+                            eprintln!("[s{}] internal error: no reply was prepared for client {:?}", server_id_context, peer_addr);
                         }
                     }
-                    Err(e) => eprintln!(
-                        "[S{}] Client failed to deserialize: {:?}",
-                        server_id_context, e
-                    ),
+                    Err(e) => eprintln!("[s{}] client failed to deserialize request from {:?}: {:?}", server_id_context, peer_addr, e),
                 }
             }
-            Err(e) => {
-                /* ... handle error reading length ... */
-                return;
+            Err(e) => { 
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    println!("[s{}] client connection closed by peer {:?}", server_id_context, peer_addr);
+                } else { 
+                    eprintln!("[s{}] client failed to read len_prefix from {:?}: {:?}", server_id_context, peer_addr, e); 
+                }
+                return; 
             }
         }
     }
