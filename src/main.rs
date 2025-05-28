@@ -133,19 +133,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tokio::time::sleep(Duration::from_secs(10)).await;
         println!("[TestClient] CMD_SEND_ATTEMPT: Attempting to send a SET command...");
         send_test_client_command(
-            "127.0.0.1:9081",
+            "127.0.0.1:9081", 
             ClientRequest::Set {
-                key: "my_cluster_key".to_string(),
-                value: "my_cluster_value_p".to_string(),
+                key: "my_cluster_key_redirect_test".to_string(),
+                value: "value_after_redirect".to_string(),
             },
         ).await;
 
         tokio::time::sleep(Duration::from_secs(2)).await;
         println!("[TestClient] CMD_SEND_ATTEMPT: Attempting to send a GET command...");
         send_test_client_command(
-            "127.0.0.1:9081",
+            "127.0.0.1:9082",
             ClientRequest::Get {
-                key: "my_cluster_key".to_string(),
+                key: "my_cluster_key_redirect_test".to_string(),
             },
         ).await;
     });
@@ -991,92 +991,112 @@ async fn handle_client_connection(
     }
 }
 
-async fn send_test_client_command(target_client_addr: &str, request: ClientRequest) {
-    println!(
-        "[TestClient] CONNECT_ATTEMPT: Attempting connection to {}", 
-        target_client_addr
-    );
-    
-    match TcpStream::connect(target_client_addr).await {
-        Ok(mut stream) => {
+async fn send_test_client_command(initial_target_client_addr: &str, request: ClientRequest) {
+    let mut current_target_addr = initial_target_client_addr.to_string();
+    let max_redirects = 3; 
+
+    for attempt in 0..=max_redirects {
+        if attempt > 0 { 
             println!(
-                "[TestClient] CONNECTED: To {}", 
-                target_client_addr
+                "[TestClient] REDIRECT_ATTEMPT #{}: Retrying command to new target {}",
+                attempt, current_target_addr
             );
-            println!("[TestClient] SEND_CMD: Sending: {:?}", request);
-            
-            match bincode::serialize(&request) {
-                Ok(serialized_req) => {
-                    let len = serialized_req.len() as u32;
-                    if stream.write_all(&len.to_be_bytes()).await.is_err() ||
-                       stream.write_all(&serialized_req).await.is_err() 
-                    {
-                        eprintln!(
-                            "[TestClient] SEND_IO_ERR to {}: Write failed.", 
-                            target_client_addr
-                        ); 
+        }
+
+        println!(
+            "[TestClient] CONNECT_ATTEMPT: Attempting connection to {} for request: {:?}",
+            current_target_addr, request
+        );
+
+        match TcpStream::connect(&current_target_addr).await {
+            Ok(mut stream) => {
+                println!("[TestClient] CONNECTED: To {}", current_target_addr);
+                println!("[TestClient] SEND_CMD: Sending: {:?}", request);
+
+                let serialized_req = match bincode::serialize(&request) {
+                    Ok(sr) => sr,
+                    Err(e) => {
+                        eprintln!("[TestClient] SER_REQ_ERR: Serialize request error: {:?}", e);
                         return;
                     }
-                    
-                    let mut len_bytes = [0u8; 4];
-                    if stream.read_exact(&mut len_bytes).await.is_ok() {
-                        let reply_len = u32::from_be_bytes(len_bytes) as usize;
-                        if reply_len > 0 && reply_len < 1_048_576 {
+                };
+
+                let len_bytes_req = (serialized_req.len() as u32).to_be_bytes();
+                if stream.write_all(&len_bytes_req).await.is_err() ||
+                   stream.write_all(&serialized_req).await.is_err() {
+                    eprintln!("[TestClient] SEND_IO_ERR to {}: Write failed.", current_target_addr);
+                    if attempt == max_redirects {
+                        eprintln!("[TestClient] SEND_IO_ERR: Max attempts reached, failing command.");
+                        return;
+                    }
+                    continue; 
+                }
+
+                let mut len_bytes_reply = [0u8; 4];
+                match stream.read_exact(&mut len_bytes_reply).await {
+                    Ok(_) => {
+                        let reply_len = u32::from_be_bytes(len_bytes_reply) as usize;
+                        if reply_len > 0 && reply_len < 1_048_576 { // Max 1MB reply
                             let mut reply_buffer = vec![0u8; reply_len];
                             if stream.read_exact(&mut reply_buffer).await.is_ok() {
                                 match bincode::deserialize::<ClientReply>(&reply_buffer) {
                                     Ok(reply) => {
-                                        println!(
-                                            "[TestClient] RECV_REPLY_OK: Received: {:?}", 
-                                            reply
-                                        );
+                                        println!("[TestClient] RECV_REPLY_OK: Received: {:?}", reply);
+
+                                        match reply {
+                                            ClientReply::LeaderRedirect { leader_id: _, leader_addr: Some(new_addr) } => {
+                                                if attempt < max_redirects {
+                                                    println!("[TestClient] REDIRECT_RECV: Redirecting to {}", new_addr);
+                                                    current_target_addr = new_addr;
+                                                    let _ = stream.shutdown().await;
+                                                    continue; 
+                                                } else {
+                                                    eprintln!("[TestClient] REDIRECT_FAIL: Max redirects ({}) reached. Last known redirect address: {}", max_redirects, new_addr);
+                                                    return; 
+                                                }
+                                            }
+                                            ClientReply::LeaderRedirect { leader_id, leader_addr: None } => {
+                                                eprintln!("[TestClient] REDIRECT_FAIL: Server indicated redirect but provided no new address (Leader ID: {}). Giving up.", leader_id);
+                                                return; 
+                                            }
+                                            _ => {
+                                                return;
+                                            }
+                                        }
                                     }
                                     Err(e) => {
-                                        eprintln!(
-                                            "[TestClient] DESER_REPLY_ERR: \
-                                            Deserialize reply error: {:?}", 
-                                            e
-                                        );
+                                        eprintln!("[TestClient] DESER_REPLY_ERR: Deserialize reply error from {}: {:?}", current_target_addr, e);
+                                        return; 
                                     }
                                 }
-                            } else { 
-                                eprintln!(
-                                    "[TestClient] READ_REPLY_BODY_ERR from {}: \
-                                    Failed to read reply body.", 
-                                    target_client_addr
-                                ); 
+                            } else {
+                                eprintln!("[TestClient] READ_REPLY_BODY_ERR from {}: Failed to read reply body.", current_target_addr);
+                                return;
                             }
-                        } else { 
-                            eprintln!(
-                                "[TestClient] INVALID_REPLY_LEN: \
-                                Invalid reply length {} from {}", 
-                                reply_len, 
-                                target_client_addr
-                            ); 
+                        } else if reply_len == 0 {
+                            println!("[TestClient] EMPTY_REPLY_RECV from {}: Server sent an empty reply.", current_target_addr);
+                            return; 
+                        }else {
+                             eprintln!("[TestClient] INVALID_REPLY_LEN: Invalid reply length {} from {}", reply_len, current_target_addr);
+                            return; 
                         }
-                    } else { 
-                        eprintln!(
-                            "[TestClient] READ_REPLY_LEN_ERR from {}: \
-                            Failed to read reply length.", 
-                            target_client_addr
-                        ); 
+                    }
+                    Err(e) => {
+                        eprintln!("[TestClient] READ_REPLY_LEN_ERR from {}: Failed to read reply length: {:?}", current_target_addr, e);
+
+                        return;
                     }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "[TestClient] SER_REQ_ERR: Serialize request error: {:?}", 
-                        e
-                    );
+            }
+            Err(e) => {
+                eprintln!("[TestClient] CONNECT_FAIL to {}: {:?}", current_target_addr, e);
+                if attempt == max_redirects {
+                    eprintln!("[TestClient] CONNECT_FAIL: Max attempts reached after connection failures.");
+                    return; 
                 }
             }
-            let _ = stream.shutdown().await;
         }
-        Err(e) => {
-            eprintln!(
-                "[TestClient] CONNECT_FAIL: Failed to connect to {}: {:?}", 
-                target_client_addr, 
-                e
-            );
-        }
-    }
+        println!("[TestClient] Attempt {} for request to {} concluded.", attempt + 1, current_target_addr);
+    } 
+    eprintln!("[TestClient] FAILED_CMD: Command {:?} failed after {} attempts. Last target: {}", request, max_redirects +1, current_target_addr);
 }
