@@ -122,6 +122,13 @@ pub struct InstallSnapshotReply {
 }
 
 #[derive(Debug)]
+struct PendingRead {
+    key: String,
+    registered_commit_index: u64,
+    reply_channel: oneshot::Sender<ClientReply>,
+}
+
+#[derive(Debug)]
 pub struct Server {
     pub id: u64,
     pub state: NodeState,
