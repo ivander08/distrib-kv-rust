@@ -148,7 +148,7 @@ pub struct Server {
     pub votes_received: HashSet<u64>,
     pub pending_client_acks: HashMap<u64, oneshot::Sender<ClientReply>>,
     pending_reads: Vec<PendingRead>,
-    current_leader_id: Option<u64>,
+    pub current_leader_id: Option<u64>,
     metadata_path: String,
     log_path: String,
     pub snapshot_path: String,

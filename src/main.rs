@@ -162,7 +162,7 @@ async fn run_server(
     raft_listen_addr: String,
     client_listen_addr: String,
     all_raft_addrs: Arc<HashMap<u64, String>>,
-    _all_client_addrs: Arc<HashMap<u64, String>>,
+    all_client_addrs: Arc<HashMap<u64, String>>,
     total_servers_in_cluster: usize,
 ) {
     println!(
@@ -193,6 +193,8 @@ async fn run_server(
 
     let server_logic_for_raft_listener = Arc::clone(&server_logic_arc);
     let total_servers_for_raft = total_servers_in_cluster;
+    let all_client_addrs_for_loop = Arc::clone(&all_client_addrs);
+    
     tokio::spawn(async move {
         loop {
             match raft_listener.accept().await {
@@ -282,13 +284,16 @@ async fn run_server(
                                     id, 
                                     addr
                                 );
-                                let server_logic_for_client_handler = 
-                                    Arc::clone(&server_logic_for_client_loop);
+
+                                let server_logic_for_client_handler = Arc::clone(&server_logic_for_client_loop);
+                                let all_client_addrs_for_handler = Arc::clone(&all_client_addrs_for_loop);
+
                                 tokio::spawn(async move {
                                     handle_client_connection(
                                         socket, 
                                         id, 
-                                        server_logic_for_client_handler
+                                        server_logic_for_client_handler,
+                                        all_client_addrs_for_handler,
                                     ).await;
                                 });
                             }
@@ -675,15 +680,16 @@ async fn handle_client_connection(
     mut stream: TcpStream,
     server_id_context: u64,
     server_logic_arc: Arc<Mutex<Server>>,
+    all_client_addrs: Arc<HashMap<u64, String>>,
 ) {
     let peer_addr_str = stream.peer_addr().map_or_else(
-        |_| "unknown client".to_string(), 
+        |_| "unknown client".to_string(),
         |pa| pa.to_string()
     );
-    
+
     println!(
-        "S{} CLIENT_HANDLER_INIT for {}: New connection.", 
-        server_id_context, 
+        "S{} CLIENT_HANDLER_INIT for {}: New connection.",
+        server_id_context,
         peer_addr_str
     );
 
@@ -695,383 +701,289 @@ async fn handle_client_connection(
                 if msg_len == 0 || msg_len > 1_048_576 {
                     eprintln!(
                         "S{} CLIENT_INVALID_MSG_LEN from {}: \
-                        Invalid length {}, closing.", 
-                        server_id_context, 
-                        peer_addr_str, 
+                         Invalid length {}, closing.",
+                        server_id_context,
+                        peer_addr_str,
                         msg_len
                     );
                     return;
                 }
-                
+
                 let mut msg_buffer = vec![0u8; msg_len];
                 if stream.read_exact(&mut msg_buffer).await.is_err() {
                     eprintln!(
-                        "S{} CLIENT_READ_BODY_ERR from {}: Failed to read body.", 
-                        server_id_context, 
+                        "S{} CLIENT_READ_BODY_ERR from {}: Failed to read body.",
+                        server_id_context,
                         peer_addr_str
                     );
                     return;
                 }
-                
+
                 match bincode::deserialize::<ClientRequest>(&msg_buffer) {
                     Ok(client_request) => {
-                        if DETAILED_LOGS { 
+                        if DETAILED_LOGS {
                             println!(
-                                "S{} CLIENT_REQ_RECV from {}: Deserialized: {:?}", 
-                                server_id_context, 
-                                peer_addr_str, 
-                                client_request
-                            ); 
+                                "S{} CLIENT_REQ_RECV from {}: Deserialized: {:?}",
+                                server_id_context,
+                                peer_addr_str,
+                                &client_request
+                            );
                         }
-                        
+
                         let mut eventual_client_reply: Option<ClientReply> = None;
                         let mut opt_log_idx_for_cleanup: Option<u64> = None;
 
-                        match client_request {
-                            ClientRequest::Set { key, value } => {
-                                let (tx, rx) = oneshot::channel::<ClientReply>();
-                                {
-                                    let mut server_guard = server_logic_arc.lock().await;
-                                    if server_guard.state != NodeState::Leader {
-                                        eventual_client_reply = Some(ClientReply::Error { 
-                                            msg: "Not the leader".to_string() 
-                                        });
-                                        println!(
-                                            "S{} CLIENT_REQ_NOT_LEADER for SET from {}: Not leader.", 
-                                            server_id_context, 
-                                            peer_addr_str
-                                        );
+                        let (is_leader_for_this_request, known_leader_id_opt, current_term_for_log) = {
+                            let server_guard = server_logic_arc.lock().await;
+                            (
+                                server_guard.state == NodeState::Leader,
+                                server_guard.current_leader_id,
+                                server_guard.current_term
+                            )
+                        };
+
+                        if !is_leader_for_this_request {
+                            match &client_request {
+                                ClientRequest::Set { .. } | ClientRequest::Delete { .. } | ClientRequest::Get { .. } => {
+                                    if let Some(leader_id) = known_leader_id_opt {
+                                        if leader_id == server_id_context {
+                                            println!(
+                                                "S{} T{} CLIENT_REQ_REDIRECT_WARN from {}: Am not leader, but known_leader_id is self ({}). Sending leader unknown.",
+                                                server_id_context, current_term_for_log, peer_addr_str, leader_id
+                                            );
+                                            eventual_client_reply = Some(ClientReply::Error {
+                                                msg: "Server is not leader, and leader status is inconsistent. Please retry.".to_string(),
+                                            });
+                                        } else {
+                                            let leader_client_addr_opt = all_client_addrs.get(&leader_id).cloned();
+                                            println!(
+                                                "S{} T{} CLIENT_REQ_REDIRECT from {}: Not leader. Known leader S{}. Addr: {:?}. Forwarding info for {:?}.",
+                                                server_id_context, current_term_for_log, peer_addr_str, leader_id, leader_client_addr_opt, client_request
+                                            );
+                                            eventual_client_reply = Some(ClientReply::LeaderRedirect {
+                                                leader_id,
+                                                leader_addr: leader_client_addr_opt,
+                                            });
+                                        }
                                     } else {
                                         println!(
-                                            "S{} CLIENT_CMD_SET_RECV from {}: \
-                                            Leader received SET for key '{}'", 
-                                            server_id_context, 
-                                            peer_addr_str, 
-                                            key
+                                            "S{} T{} CLIENT_REQ_REDIRECT_FAIL from {}: Not leader and leader unknown. Cannot redirect for {:?}.",
+                                            server_id_context, current_term_for_log, peer_addr_str, client_request
                                         );
-                                        
-                                        let command = Command::Set { 
-                                            key: key.clone(), 
-                                            value 
-                                        };
-                                        let log_entry = LogEntry { 
-                                            term: server_guard.current_term, 
-                                            command 
-                                        };
-                                        
-                                        server_guard.log.push(log_entry);
-                                        let new_log_index_in_mem = server_guard.log.len() - 1;
-                                        server_guard.persist_log_entry(new_log_index_in_mem);
-                                        let new_log_index_raft = server_guard.log.len() as u64;
-                                        opt_log_idx_for_cleanup = Some(new_log_index_raft);
-                                        server_guard.pending_client_acks.insert(
-                                            new_log_index_raft, 
-                                            tx
-                                        );
-                                        
-                                        println!(
-                                            "S{} CLIENT_CMD_SET_APPENDED_PERSISTED for {}: \
-                                            Appended and Persisted SET for key '{}' to log idx {}. \
-                                            Awaiting commit.", 
-                                            server_id_context, 
-                                            peer_addr_str, 
-                                            key, 
-                                            new_log_index_raft
-                                        );
-                                    }
-                                }
-                                
-                                if eventual_client_reply.is_none() {
-                                    if let Some(log_idx) = opt_log_idx_for_cleanup {
-                                        if DETAILED_LOGS { 
-                                            println!(
-                                                "S{} CLIENT_AWAIT_COMMIT for log {}: \
-                                                Waiting for commit signal for SET from {}.", 
-                                                server_id_context, 
-                                                log_idx, 
-                                                peer_addr_str
-                                            ); 
-                                        }
-                                        
-                                        match tokio::time::timeout(
-                                            Duration::from_secs(10), 
-                                            rx
-                                        ).await {
-                                            Ok(Ok(committed_reply)) => { 
-                                                eventual_client_reply = Some(committed_reply); 
-                                                println!(
-                                                    "S{} CLIENT_COMMIT_OK for log {}: \
-                                                    SET committed for {}.", 
-                                                    server_id_context, 
-                                                    log_idx, 
-                                                    peer_addr_str
-                                                ); 
-                                            }
-                                            Ok(Err(_)) => { 
-                                                eventual_client_reply = Some(ClientReply::Error { 
-                                                    msg: "Command processing aborted (channel closed)".to_string() 
-                                                }); 
-                                                eprintln!(
-                                                    "S{} CLIENT_COMMIT_CHAN_CLOSED for log {}: \
-                                                    Oneshot closed before ack for SET from {}.", 
-                                                    server_id_context, 
-                                                    log_idx, 
-                                                    peer_addr_str
-                                                ); 
-                                            }
-                                            Err(_) => { 
-                                                eventual_client_reply = Some(ClientReply::Error { 
-                                                    msg: "Command timed out".to_string() 
-                                                }); 
-                                                eprintln!(
-                                                    "S{} CLIENT_COMMIT_TIMEOUT for log {}: \
-                                                    Timeout for SET from {}.", 
-                                                    server_id_context, 
-                                                    log_idx, 
-                                                    peer_addr_str
-                                                ); 
-                                                server_logic_arc.lock().await
-                                                    .pending_client_acks.remove(&log_idx); 
-                                            }
-                                        }
+                                        eventual_client_reply = Some(ClientReply::Error {
+                                            msg: "Leader currently unknown. Please retry.".to_string(),
+                                        });
                                     }
                                 }
                             }
-                            ClientRequest::Delete { key } => {
-                                let (tx, rx) = oneshot::channel::<ClientReply>();
-                                {
-                                    let mut server_guard = server_logic_arc.lock().await;
-                                    if server_guard.state != NodeState::Leader {
-                                        eventual_client_reply = Some(ClientReply::Error { 
-                                            msg: "Not the leader".to_string() 
-                                        });
-                                        println!(
-                                            "S{} CLIENT_REQ_NOT_LEADER for DELETE from {}: Not leader.", 
-                                            server_id_context, 
-                                            peer_addr_str
-                                        );
-                                    } else {
-                                        println!(
-                                            "S{} CLIENT_CMD_DELETE_RECV from {}: \
-                                            Leader received DELETE for key '{}'", 
-                                            server_id_context, 
-                                            peer_addr_str, 
-                                            key
-                                        );
-                                        
-                                        let command = Command::Delete { 
-                                            key: key.clone() 
-                                        };
-                                        let log_entry = LogEntry { 
-                                            term: server_guard.current_term, 
-                                            command 
-                                        };
-                                        
-                                        server_guard.log.push(log_entry);
-                                        let new_log_index_in_mem = server_guard.log.len() - 1;
-                                        server_guard.persist_log_entry(new_log_index_in_mem);
-                                        let new_log_index_raft = server_guard.log.len() as u64;
-                                        opt_log_idx_for_cleanup = Some(new_log_index_raft);
-                                        server_guard.pending_client_acks.insert(
-                                            new_log_index_raft, 
-                                            tx
-                                        );
-                                        
-                                        println!(
-                                            "S{} CLIENT_CMD_DELETE_APPENDED_PERSISTED for {}: \
-                                            Appended and Persisted DELETE for key '{}' to log idx {}. \
-                                            Awaiting commit.", 
-                                            server_id_context, 
-                                            peer_addr_str, 
-                                            key, 
-                                            new_log_index_raft
-                                        );
-                                    }
-                                }
-                                
-                                if eventual_client_reply.is_none() {
-                                    if let Some(log_idx) = opt_log_idx_for_cleanup {
-                                        if DETAILED_LOGS { 
+                        } else {
+                            match client_request {
+                                ClientRequest::Set { key, value } => {
+                                    let (tx, rx) = oneshot::channel::<ClientReply>();
+                                    {
+                                        let mut server_guard = server_logic_arc.lock().await;
+                                        if server_guard.state != NodeState::Leader {
+                                            let _ = tx.send(ClientReply::Error { msg: "Not the leader (state changed)".to_string() });
+                                        } else {
                                             println!(
-                                                "S{} CLIENT_AWAIT_COMMIT for log {}: \
-                                                Waiting for commit signal for DELETE from {}.", 
-                                                server_id_context, 
-                                                log_idx, 
-                                                peer_addr_str
-                                            ); 
+                                                "S{} CLIENT_CMD_SET_RECV from {}: Leader received SET for key '{}'",
+                                                server_id_context, peer_addr_str, key
+                                            );
+                                            let command = Command::Set { key: key.clone(), value };
+                                            let log_entry = LogEntry { term: server_guard.current_term, command };
+                                            server_guard.log.push(log_entry);
+                                            let new_log_index_in_mem = server_guard.log.len() - 1;
+                                            server_guard.persist_log_entry(new_log_index_in_mem);
+                                            let new_log_index_raft = server_guard.log.len() as u64;
+                                            opt_log_idx_for_cleanup = Some(new_log_index_raft);
+                                            server_guard.pending_client_acks.insert(new_log_index_raft, tx);
+                                            println!(
+                                                "S{} CLIENT_CMD_SET_APPENDED_PERSISTED for {}: Appended and Persisted SET for key '{}' to log idx {}. Awaiting commit.",
+                                                server_id_context, peer_addr_str, key, new_log_index_raft
+                                            );
                                         }
-                                        
-                                        match tokio::time::timeout(
-                                            Duration::from_secs(10), 
-                                            rx
-                                        ).await {
-                                            Ok(Ok(committed_reply)) => { 
-                                                eventual_client_reply = Some(committed_reply); 
-                                                println!(
-                                                    "S{} CLIENT_COMMIT_OK for log {}: \
-                                                    DELETE committed for {}.", 
-                                                    server_id_context, 
-                                                    log_idx, 
-                                                    peer_addr_str
-                                                ); 
+                                    }
+
+                                    if opt_log_idx_for_cleanup.is_some() {
+                                        match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                                            Ok(Ok(committed_reply)) => {
+                                                eventual_client_reply = Some(committed_reply);
+                                                println!("S{} CLIENT_COMMIT_OK for log {}: SET committed for {}.", server_id_context, opt_log_idx_for_cleanup.unwrap_or(0), peer_addr_str);
                                             }
-                                            Ok(Err(_)) => { 
-                                                eventual_client_reply = Some(ClientReply::Error { 
-                                                    msg: "Command processing aborted (channel closed)".to_string() 
-                                                }); 
-                                                eprintln!(
-                                                    "S{} CLIENT_COMMIT_CHAN_CLOSED for log {}: \
-                                                    Oneshot closed before ack for DELETE from {}.", 
-                                                    server_id_context, 
-                                                    log_idx, 
-                                                    peer_addr_str
-                                                ); 
+                                            Ok(Err(_)) => {
+                                                eventual_client_reply = Some(ClientReply::Error { msg: "Command processing aborted (channel closed)".to_string() });
+                                                eprintln!("S{} CLIENT_COMMIT_CHAN_CLOSED for log {}: Oneshot closed before ack for SET from {}.", server_id_context, opt_log_idx_for_cleanup.unwrap_or(0), peer_addr_str);
                                             }
-                                            Err(_) => { 
-                                                eventual_client_reply = Some(ClientReply::Error { 
-                                                    msg: "Command timed out".to_string() 
-                                                }); 
-                                                eprintln!(
-                                                    "S{} CLIENT_COMMIT_TIMEOUT for log {}: \
-                                                    Timeout for DELETE from {}.", 
-                                                    server_id_context, 
-                                                    log_idx, 
-                                                    peer_addr_str
-                                                ); 
-                                                server_logic_arc.lock().await
-                                                    .pending_client_acks.remove(&log_idx); 
+                                            Err(_) => {
+                                                eventual_client_reply = Some(ClientReply::Error { msg: "Command timed out".to_string() });
+                                                if let Some(log_idx_to_clean) = opt_log_idx_for_cleanup {
+                                                    let mut server_guard = server_logic_arc.lock().await;
+                                                    server_guard.pending_client_acks.remove(&log_idx_to_clean);
+                                                    eprintln!("S{} CLIENT_COMMIT_TIMEOUT for log {}: Timeout for SET from {}, cleaned pending ack.", server_id_context, log_idx_to_clean, peer_addr_str);
+                                                }
                                             }
+                                        }
+                                    } else if eventual_client_reply.is_none() { // If tx.send was called due to not being leader
+                                         match tokio::time::timeout(Duration::from_secs(1), rx).await {
+                                            Ok(Ok(reply_from_non_leader_path)) => eventual_client_reply = Some(reply_from_non_leader_path),
+                                            _ => eprintln!("S{} CLIENT_SET_NL_REPLY_ERR: Error getting non-leader reply for SET from {}", server_id_context, peer_addr_str),
                                         }
                                     }
                                 }
-                            }
-                            ClientRequest::Get { key } => {
-                                let (tx_reply_channel, rx_reply_channel) = oneshot::channel::<ClientReply>();
-                                let mut is_leader_for_get = false;
-                                {
-                                    let mut server_guard = server_logic_arc.lock().await;
-                                    if server_guard.state == NodeState::Leader {
-                                        is_leader_for_get = true;
-                                        server_guard.register_linearizable_read(key.clone(), tx_reply_channel);
-                                    } else {
-                                        println!(
-                                            "S{} CLIENT_REQ_NOT_LEADER for GET from {}: Not leader for key '{}'.",
+                                ClientRequest::Delete { key } => {
+                                    let (tx, rx) = oneshot::channel::<ClientReply>();
+                                    {
+                                        let mut server_guard = server_logic_arc.lock().await;
+                                        if server_guard.state != NodeState::Leader {
+                                            let _ = tx.send(ClientReply::Error { msg: "Not the leader (state changed)".to_string() });
+                                        } else {
+                                            println!(
+                                                "S{} CLIENT_CMD_DELETE_RECV from {}: Leader received DELETE for key '{}'",
+                                                server_id_context, peer_addr_str, key
+                                            );
+                                            let command = Command::Delete { key: key.clone() };
+                                            let log_entry = LogEntry { term: server_guard.current_term, command };
+                                            server_guard.log.push(log_entry);
+                                            let new_log_index_in_mem = server_guard.log.len() - 1;
+                                            server_guard.persist_log_entry(new_log_index_in_mem);
+                                            let new_log_index_raft = server_guard.log.len() as u64;
+                                            opt_log_idx_for_cleanup = Some(new_log_index_raft);
+                                            server_guard.pending_client_acks.insert(new_log_index_raft, tx);
+                                            println!(
+                                                "S{} CLIENT_CMD_DELETE_APPENDED_PERSISTED for {}: Appended and Persisted DELETE for key '{}' to log idx {}. Awaiting commit.",
+                                                server_id_context, peer_addr_str, key, new_log_index_raft
+                                            );
+                                        }
+                                    }
+
+                                    if opt_log_idx_for_cleanup.is_some() {
+                                        match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                                            Ok(Ok(committed_reply)) => {
+                                                eventual_client_reply = Some(committed_reply);
+                                                println!("S{} CLIENT_COMMIT_OK for log {}: DELETE committed for {}.", server_id_context, opt_log_idx_for_cleanup.unwrap_or(0), peer_addr_str);
+                                            }
+                                            Ok(Err(_)) => {
+                                                eventual_client_reply = Some(ClientReply::Error { msg: "Command processing aborted (channel closed)".to_string() });
+                                                eprintln!("S{} CLIENT_COMMIT_CHAN_CLOSED for log {}: Oneshot closed before ack for DELETE from {}.", server_id_context, opt_log_idx_for_cleanup.unwrap_or(0), peer_addr_str);
+                                            }
+                                            Err(_) => {
+                                                eventual_client_reply = Some(ClientReply::Error { msg: "Command timed out".to_string() });
+                                                if let Some(log_idx_to_clean) = opt_log_idx_for_cleanup {
+                                                    let mut server_guard = server_logic_arc.lock().await;
+                                                    server_guard.pending_client_acks.remove(&log_idx_to_clean);
+                                                    eprintln!("S{} CLIENT_COMMIT_TIMEOUT for log {}: Timeout for DELETE from {}, cleaned pending ack.", server_id_context, log_idx_to_clean, peer_addr_str);
+                                                }
+                                            }
+                                        }
+                                    } else if eventual_client_reply.is_none() {
+                                        match tokio::time::timeout(Duration::from_secs(1), rx).await {
+                                            Ok(Ok(reply_from_non_leader_path)) => eventual_client_reply = Some(reply_from_non_leader_path),
+                                            _ => eprintln!("S{} CLIENT_DEL_NL_REPLY_ERR: Error getting non-leader reply for DEL from {}", server_id_context, peer_addr_str),
+                                        }
+                                    }
+                                }
+                                ClientRequest::Get { key } => {
+                                    let (tx_reply_channel, rx_reply_channel) = oneshot::channel::<ClientReply>();
+                                    let mut registered_by_leader = false;
+                                    {
+                                        let mut server_guard = server_logic_arc.lock().await;
+                                        if server_guard.state == NodeState::Leader {
+                                            server_guard.register_linearizable_read(key.clone(), tx_reply_channel);
+                                            registered_by_leader = true;
+                                        } else {
+                                            let _ = tx_reply_channel.send(ClientReply::Error { msg: "Not the leader (state changed)".to_string() });
+                                        }
+                                    }
+
+                                    if registered_by_leader {
+                                         println!(
+                                            "S{} CLIENT_CMD_GET_AWAIT from {}: Leader registered GET for key '{}', awaiting linearizable reply.",
                                             server_id_context, peer_addr_str, key
                                         );
-
-                                        let _ = tx_reply_channel.send(ClientReply::Error {
-                                            msg: "Not the leader".to_string(),
-                                        });
                                     }
-                                }
-                                if is_leader_for_get {
-                                    println!(
-                                        "S{} CLIENT_CMD_GET_AWAIT from {}: Leader registered GET for key '{}', awaiting linearizable reply.",
-                                        server_id_context, peer_addr_str, key
-                                    );
-                                }
 
-                                match tokio::time::timeout(Duration::from_secs(10), rx_reply_channel).await {
-                                    Ok(Ok(committed_reply)) => {
-                                        eventual_client_reply = Some(committed_reply);
-                                        if is_leader_for_get {
-                                            println!(
-                                                "S{} CLIENT_GET_REPLY_OK from {}: Received linearizable read result for key '{}'.",
+                                    match tokio::time::timeout(Duration::from_secs(10), rx_reply_channel).await {
+                                        Ok(Ok(committed_reply)) => {
+                                            eventual_client_reply = Some(committed_reply);
+                                            if registered_by_leader {
+                                                println!(
+                                                    "S{} CLIENT_GET_REPLY_OK from {}: Received linearizable read result for key '{}'.",
+                                                    server_id_context, peer_addr_str, key
+                                                );
+                                            }
+                                        }
+                                        Ok(Err(_)) => {
+                                            eventual_client_reply = Some(ClientReply::Error { msg: "Read operation aborted on server".to_string() });
+                                            eprintln!(
+                                                "S{} CLIENT_GET_REPLY_ABORTED from {}: Reply channel closed for key '{}'.",
+                                                server_id_context, peer_addr_str, key
+                                            );
+                                        }
+                                        Err(_timeout_err) => {
+                                            eventual_client_reply = Some(ClientReply::Error { msg: "Read operation timed out".to_string() });
+                                            eprintln!(
+                                                "S{} CLIENT_GET_TIMEOUT from {}: Timed out waiting for linearizable read reply for key '{}'.",
                                                 server_id_context, peer_addr_str, key
                                             );
                                         }
                                     }
-                                    Ok(Err(_)) => { 
-                                        eprintln!(
-                                            "S{} CLIENT_GET_REPLY_ABORTED from {}: Reply channel closed for key '{}' (likely server shutdown or internal issue).",
-                                            server_id_context, peer_addr_str, key
-                                        );
-                                        eventual_client_reply = Some(ClientReply::Error {
-                                            msg: "Read operation aborted on server".to_string(),
-                                        });
-                                    }
-                                    Err(_timeout_err) => {
-                                        eprintln!(
-                                            "S{} CLIENT_GET_TIMEOUT from {}: Timed out waiting for linearizable read reply for key '{}'.",
-                                            server_id_context, peer_addr_str, key
-                                        );
-                                        eventual_client_reply = Some(ClientReply::Error {
-                                            msg: "Read operation timed out".to_string(),
-                                        });
-                                    }
                                 }
                             }
                         }
-            
+
                         if let Some(reply) = eventual_client_reply {
                             match bincode::serialize(&reply) {
                                 Ok(serialized_reply) => {
-                                    let len = serialized_reply.len() as u32;
-                                    if stream.write_all(&len.to_be_bytes()).await.is_err() ||
-                                       stream.write_all(&serialized_reply).await.is_err() 
+                                    let len_bytes_reply = (serialized_reply.len() as u32).to_be_bytes();
+                                    if stream.write_all(&len_bytes_reply).await.is_err() ||
+                                       stream.write_all(&serialized_reply).await.is_err()
                                     {
                                         eprintln!(
-                                            "S{} CLIENT_REPLY_SEND_IO_ERR to {}: Send reply failed.", 
-                                            server_id_context, 
-                                            peer_addr_str
-                                        ); 
+                                            "S{} CLIENT_REPLY_SEND_IO_ERR to {}: Send reply failed.",
+                                            server_id_context, peer_addr_str
+                                        );
                                         return;
                                     }
-                                    
-                                    if DETAILED_LOGS { 
+                                    if DETAILED_LOGS {
                                         println!(
-                                            "S{} CLIENT_REPLY_SENT to {}: Reply: {:?}", 
-                                            server_id_context, 
-                                            peer_addr_str, 
-                                            reply
-                                        ); 
+                                            "S{} CLIENT_REPLY_SENT to {}: Reply: {:?}",
+                                            server_id_context, peer_addr_str, reply
+                                        );
                                     }
                                 }
                                 Err(e) => {
                                     eprintln!(
-                                        "S{} CLIENT_REPLY_SER_ERR: \
-                                        Failed to serialize client reply {:?}: {:?}", 
-                                        server_id_context, 
-                                        reply, 
-                                        e
+                                        "S{} CLIENT_REPLY_SER_ERR: Failed to serialize client reply {:?}: {:?}",
+                                        server_id_context, reply, e
                                     );
                                 }
                             }
                         } else {
                             eprintln!(
-                                "S{} CLIENT_NO_REPLY_INTERNAL_ERR for {}: \
-                                No reply was prepared.", 
-                                server_id_context, 
-                                peer_addr_str
+                                "S{} CLIENT_NO_REPLY_INTERNAL_ERR for {}: No reply was prepared.",
+                                server_id_context, peer_addr_str
                             );
                         }
                     }
                     Err(e) => {
                         eprintln!(
-                            "S{} CLIENT_REQ_DESER_ERR from {}: \
-                            Failed to deserialize request: {:?}", 
-                            server_id_context, 
-                            peer_addr_str, 
-                            e
+                            "S{} CLIENT_REQ_DESER_ERR from {}: Failed to deserialize request: {:?}",
+                            server_id_context, peer_addr_str, e
                         );
                     }
                 }
             }
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof { 
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
                     println!(
-                        "S{} CLIENT_CONN_CLOSED by {}: Connection closed.", 
-                        server_id_context, 
-                        peer_addr_str
+                        "S{} CLIENT_CONN_CLOSED by {}: Connection closed.",
+                        server_id_context, peer_addr_str
                     );
-                } else { 
+                } else {
                     eprintln!(
-                        "S{} CLIENT_READ_LEN_ERR from {}: \
-                        Failed to read length prefix: {:?}", 
-                        server_id_context, 
-                        peer_addr_str, 
-                        e
-                    ); 
+                        "S{} CLIENT_READ_LEN_ERR from {}: Failed to read length prefix: {:?}",
+                        server_id_context, peer_addr_str, e
+                    );
                 }
                 return;
             }
