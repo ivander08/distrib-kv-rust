@@ -18,6 +18,7 @@ pub enum NodeState {
 pub enum Command {
     Set { key: String, value: String },
     Delete { key: String },
+    NoOp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1173,6 +1174,14 @@ impl Server {
                     Command::Delete { key } => {
                         self.kv_store.remove(&key);
                     }
+                    Command::NoOp => {
+                        if CORE_DETAILED_LOGS {
+                            println!(
+                                "S{} T{} APPLY_LOG_ENTRY: Applying NoOp at log idx {}.",
+                                self.id, self.current_term, current_apply_idx
+                            );
+                        }
+                    }
                 }
 
                 self.last_applied = current_apply_idx;
@@ -1361,7 +1370,7 @@ impl Server {
                 (total_servers / 2) + 1
             );
 
-            if self.votes_received.len() > total_servers / 2 {
+            if self.state == NodeState::Candidate && self.votes_received.len() > total_servers / 2 {
                 println!(
                     "S{} T{} ELECTED_LEADER: With {} votes",
                     self.id,
@@ -1370,14 +1379,39 @@ impl Server {
                 );
 
                 self.state = NodeState::Leader;
-                self.last_heartbeat = Instant::now(); 
+                self.last_heartbeat = Instant::now();
 
-                let last_log_idx = self.log.len() as u64;
+                let mut no_op_needed = true;
+                if self.commit_index > 0 {
+                    let commit_log_entry_vec_idx = (self.commit_index - 1) as usize;
+                    if commit_log_entry_vec_idx < self.log.len() {
+                        if self.log[commit_log_entry_vec_idx].term == self.current_term {
+                            no_op_needed = false;
+                        }
+                    }
+                }
+
+                if no_op_needed {
+                    println!(
+                        "S{} T{} LEADER_PROPOSE_NOOP: Proposing NoOp to anchor current term.",
+                        self.id, self.current_term
+                    );
+                    let no_op_entry = LogEntry {
+                        term: self.current_term,
+                        command: Command::NoOp,
+                    };
+                    self.log.push(no_op_entry);
+                    self.persist_log_entry(self.log.len() - 1);
+                }
+
+                let current_leader_last_log_idx = self.log.len() as u64;
+                let _current_leader_last_log_term = self.log.last().map_or(0, |e| e.term); // For reference
+
                 self.peer_ids
                     .iter()
                     .filter(|&&p| p != self.id)
                     .for_each(|&p| {
-                        self.next_index.insert(p, last_log_idx + 1);
+                        self.next_index.insert(p, current_leader_last_log_idx + 1);
                         self.match_index.insert(p, 0);
                     });
 
@@ -1389,7 +1423,7 @@ impl Server {
                             RpcMessage::AppendEntries(AppendEntriesArgs {
                                 term: self.current_term,
                                 leader_id: self.id,
-                                prev_log_index: last_log_idx,
+                                prev_log_index: current_leader_last_log_idx,
                                 prev_log_term: self.log.last().map_or(0, |e| e.term),
                                 entries: Vec::new(),
                                 leader_commit: self.commit_index,
@@ -1400,7 +1434,6 @@ impl Server {
                 return Some(messages);
             }
         }
-
         None
     }
 }
