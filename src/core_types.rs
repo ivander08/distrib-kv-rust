@@ -909,21 +909,22 @@ impl Server {
         }
 
         let old_last_applied = self.last_applied;
-        if self.commit_index > self.last_applied {
-            self.apply_committed_entries();
-            if self.last_applied > old_last_applied && CORE_DETAILED_LOGS {
-                println!(
-                    "S{} T{} APPLY_BATCH_DONE: Applied {} entries ({}->{}). KV store size: {}.",
-                    self.id,
-                    self.current_term,
-                    self.last_applied - old_last_applied,
-                    old_last_applied,
-                    self.last_applied,
-                    self.kv_store.len()
-                );
-            }
+        self.apply_committed_entries();
+
+
+        if self.last_applied > old_last_applied && CORE_DETAILED_LOGS {
+            println!(
+                "S{} T{} APPLY_BATCH_DONE: Applied {} entries ({}->{}). KV store size: {}.",
+                self.id,
+                self.current_term,
+                self.last_applied - old_last_applied,
+                old_last_applied,
+                self.last_applied,
+                self.kv_store.len()
+            );
         }
-        messages_to_send
+
+        messages_to_send 
     }
 
     pub fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
@@ -1498,6 +1499,25 @@ impl Server {
                 self.state = NodeState::Leader;
                 self.current_leader_id = Some(self.id);
                 self.last_heartbeat = Instant::now();
+
+                println!(
+                    "S{} T{} BECOME_LEADER_CHECK: current_term={}, commit_index={}, log_len={}",
+                    self.id, self.current_term, self.current_term, self.commit_index, self.log.len()
+                );
+                if self.commit_index > 0 {
+                    let commit_log_entry_vec_idx_check = (self.commit_index - 1) as usize;
+                    if commit_log_entry_vec_idx_check < self.log.len() {
+                        println!(
+                            "S{} T{} BECOME_LEADER_CHECK: Entry at (commit_index-1) has term: {}",
+                            self.id, self.current_term, self.log[commit_log_entry_vec_idx_check].term
+                        );
+                    } else {
+                        println!(
+                            "S{} T{} BECOME_LEADER_CHECK: commit_index-1 ({}) is out of bounds for log_len {}.",
+                            self.id, self.current_term, commit_log_entry_vec_idx_check, self.log.len()
+                        );
+                    }
+                }
 
                 let mut no_op_needed = true;
                 if self.commit_index > 0 {
