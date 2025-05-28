@@ -946,31 +946,63 @@ async fn handle_client_connection(
                                 }
                             }
                             ClientRequest::Get { key } => {
-                                let server_guard = server_logic_arc.lock().await;
-                                if server_guard.state != NodeState::Leader {
-                                    eventual_client_reply = Some(ClientReply::Error { 
-                                        msg: "Not the leader".to_string() 
-                                    });
+                                let (tx_reply_channel, rx_reply_channel) = oneshot::channel::<ClientReply>();
+                                let mut is_leader_for_get = false;
+                                {
+                                    let mut server_guard = server_logic_arc.lock().await;
+                                    if server_guard.state == NodeState::Leader {
+                                        is_leader_for_get = true;
+                                        server_guard.register_linearizable_read(key.clone(), tx_reply_channel);
+                                    } else {
+                                        println!(
+                                            "S{} CLIENT_REQ_NOT_LEADER for GET from {}: Not leader for key '{}'.",
+                                            server_id_context, peer_addr_str, key
+                                        );
+
+                                        let _ = tx_reply_channel.send(ClientReply::Error {
+                                            msg: "Not the leader".to_string(),
+                                        });
+                                    }
+                                }
+                                if is_leader_for_get {
                                     println!(
-                                        "S{} CLIENT_REQ_NOT_LEADER for GET from {}: Not leader.", 
-                                        server_id_context, 
-                                        peer_addr_str
+                                        "S{} CLIENT_CMD_GET_AWAIT from {}: Leader registered GET for key '{}', awaiting linearizable reply.",
+                                        server_id_context, peer_addr_str, key
                                     );
-                                } else {
-                                    println!(
-                                        "S{} CLIENT_CMD_GET_RECV from {}: \
-                                        Leader received GET for key '{}'", 
-                                        server_id_context, 
-                                        peer_addr_str, 
-                                        key
-                                    );
-                                    
-                                    let value = server_guard.kv_store.get(&key).cloned();
-                                    eventual_client_reply = Some(ClientReply::Value { key, value });
+                                }
+
+                                match tokio::time::timeout(Duration::from_secs(10), rx_reply_channel).await {
+                                    Ok(Ok(committed_reply)) => {
+                                        eventual_client_reply = Some(committed_reply);
+                                        if is_leader_for_get {
+                                            println!(
+                                                "S{} CLIENT_GET_REPLY_OK from {}: Received linearizable read result for key '{}'.",
+                                                server_id_context, peer_addr_str, key
+                                            );
+                                        }
+                                    }
+                                    Ok(Err(_)) => { 
+                                        eprintln!(
+                                            "S{} CLIENT_GET_REPLY_ABORTED from {}: Reply channel closed for key '{}' (likely server shutdown or internal issue).",
+                                            server_id_context, peer_addr_str, key
+                                        );
+                                        eventual_client_reply = Some(ClientReply::Error {
+                                            msg: "Read operation aborted on server".to_string(),
+                                        });
+                                    }
+                                    Err(_timeout_err) => {
+                                        eprintln!(
+                                            "S{} CLIENT_GET_TIMEOUT from {}: Timed out waiting for linearizable read reply for key '{}'.",
+                                            server_id_context, peer_addr_str, key
+                                        );
+                                        eventual_client_reply = Some(ClientReply::Error {
+                                            msg: "Read operation timed out".to_string(),
+                                        });
+                                    }
                                 }
                             }
                         }
-                        
+            
                         if let Some(reply) = eventual_client_reply {
                             match bincode::serialize(&reply) {
                                 Ok(serialized_reply) => {

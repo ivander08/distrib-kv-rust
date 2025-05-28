@@ -125,7 +125,7 @@ pub struct InstallSnapshotReply {
 struct PendingRead {
     key: String,
     registered_commit_index: u64,
-    reply_channel: oneshot::Sender<ClientReply>,
+    reply_channel: Option<oneshot::Sender<ClientReply>>,
 }
 
 #[derive(Debug)]
@@ -147,6 +147,8 @@ pub struct Server {
     pub peer_ids: Vec<u64>,
     pub votes_received: HashSet<u64>,
     pub pending_client_acks: HashMap<u64, oneshot::Sender<ClientReply>>,
+    pending_reads: Vec<PendingRead>,
+    current_leader_id: Option<u64>,
     metadata_path: String,
     log_path: String,
     pub snapshot_path: String,
@@ -182,6 +184,8 @@ impl Server {
             peer_ids,
             votes_received: HashSet::new(),
             pending_client_acks: HashMap::new(),
+            pending_reads: Vec::new(),
+            current_leader_id: None,
             metadata_path,
             log_path,
             snapshot_path,
@@ -222,6 +226,27 @@ impl Server {
                 self.id, self.current_term, self.election_timeout_due
             );
         }
+    }
+
+    pub fn register_linearizable_read(
+        &mut self,
+        key: String,
+        reply_channel: oneshot::Sender<ClientReply>,
+    ) {
+        let current_commit_idx = self.commit_index;
+
+        if CORE_DETAILED_LOGS {
+            println!(
+                "S{} T{} REGISTER_LINEARIZABLE_READ: Key '{}' at commit_idx {}. KV_applied_idx: {}",
+                self.id, self.current_term, key, current_commit_idx, self.last_applied
+            );
+        }
+
+        self.pending_reads.push(PendingRead {
+            key,
+            registered_commit_index: current_commit_idx,
+            reply_channel: Some(reply_channel),
+        });
     }
 
     fn save_metadata(&self) {
@@ -783,6 +808,7 @@ impl Server {
                         self.id, self.current_term, self.election_timeout_due, now
                     );
                     self.state = NodeState::Candidate;
+                    self.current_leader_id = None;
                 }
             }
             NodeState::Candidate => {
@@ -794,6 +820,7 @@ impl Server {
                     );
                     self.current_term = new_term_candidate;
                     self.voted_for = Some(self.id);
+                    self.current_leader_id = None;
                     self.save_metadata();
                     self.votes_received.clear();
                     self.votes_received.insert(self.id);
@@ -928,6 +955,8 @@ impl Server {
         }
 
         self.reset_election_timer();
+        self.current_leader_id = Some(args.leader_id);
+
         if args.term > self.current_term {
             println!(
                 "S{} TERM_UPDATE_AE from L{}(T{}): New term (our T{} -> T{}). Becoming Follower.",
@@ -1165,74 +1194,155 @@ impl Server {
 
     pub fn apply_committed_entries(&mut self) {
         while self.last_applied < self.commit_index {
-            let current_apply_idx = self.last_applied + 1;
-            let vec_idx = self.last_applied as usize;
-            if vec_idx < self.log.len() {
-                let entry = self.log[vec_idx].clone();
-                println!(
-                    "S{} T{} APPLY_LOG_ENTRY: Applying log idx {} to KV: {:?}",
-                    self.id, self.current_term, current_apply_idx, entry.command
-                );
+            let current_apply_idx_raft = self.last_applied + 1;
+            let vec_idx_to_apply = self.last_applied as usize;
+
+            if vec_idx_to_apply < self.log.len() {
+                let entry = self.log[vec_idx_to_apply].clone();
 
                 match entry.command {
                     Command::Set { key, value } => {
+                        if CORE_DETAILED_LOGS {
+                            println!(
+                                "S{} T{} APPLY_LOG_ENTRY_SET: Applying Set cmd for key '{}' at raft_idx {}.",
+                                self.id, self.current_term, key, current_apply_idx_raft
+                            );
+                        }
                         self.kv_store.insert(key, value);
                     }
                     Command::Delete { key } => {
+                        if CORE_DETAILED_LOGS {
+                            println!(
+                                "S{} T{} APPLY_LOG_ENTRY_DELETE: Applying Delete cmd for key '{}' at raft_idx {}.",
+                                self.id, self.current_term, key, current_apply_idx_raft
+                            );
+                        }
                         self.kv_store.remove(&key);
                     }
                     Command::NoOp => {
                         if CORE_DETAILED_LOGS {
                             println!(
-                                "S{} T{} APPLY_LOG_ENTRY: Applying NoOp at log idx {}.",
-                                self.id, self.current_term, current_apply_idx
+                                "S{} T{} APPLY_LOG_ENTRY_NOOP: Applying NoOp at raft_idx {}.",
+                                self.id, self.current_term, current_apply_idx_raft
                             );
                         }
                     }
                 }
 
-                self.last_applied = current_apply_idx;
-                if let Some(ack_sender) = self.pending_client_acks.remove(&current_apply_idx) {
-                    let reply = ClientReply::Success {
-                        command_applied_at_log_index: current_apply_idx,
-                    };
+                self.last_applied = current_apply_idx_raft;
 
+                if let Some(ack_sender) = self.pending_client_acks.remove(&current_apply_idx_raft) {
+                    let reply = ClientReply::Success {
+                        command_applied_at_log_index: current_apply_idx_raft,
+                    };
                     if ack_sender.send(reply).is_ok() {
                         if CORE_DETAILED_LOGS {
                             println!(
-                                "S{} T{} CLIENT_ACK_SENT: Sent commit ACK for log idx {}.",
-                                self.id, self.current_term, current_apply_idx
+                                "S{} T{} CLIENT_ACK_SENT_APPLY: Sent commit ACK for log raft_idx {}.",
+                                self.id, self.current_term, current_apply_idx_raft
                             );
                         }
                     } else {
                         eprintln!(
-                            "S{} T{} CLIENT_ACK_FAIL: Failed to send commit ACK for log idx {} \
-                            (client likely disconnected).",
-                            self.id, self.current_term, current_apply_idx
+                            "S{} T{} CLIENT_ACK_FAIL_APPLY: Failed to send commit ACK for log raft_idx {} (client likely disconnected).",
+                            self.id, self.current_term, current_apply_idx_raft
                         );
                     }
                 }
             } else {
                 eprintln!(
-                    "S{} T{} APPLY_LOG_CRITICAL_ERR: Trying to apply log_idx {} (vec_idx {}) \
-                    but log_len is {}. Halting.",
+                    "S{} T{} APPLY_LOG_CRITICAL_ERR: Trying to apply log raft_idx {} (vec_idx {}) but log_len is {}. Halting apply loop.",
                     self.id,
                     self.current_term,
-                    current_apply_idx,
-                    vec_idx,
+                    current_apply_idx_raft,
+                    vec_idx_to_apply,
                     self.log.len()
                 );
                 break;
             }
         }
+        if self.state == NodeState::Leader {
+            let current_last_applied_for_reads = self.last_applied;
+            let mut reads_processed_this_cycle = 0;
+
+            self.pending_reads.retain_mut(|read_op| {
+            if current_last_applied_for_reads >= read_op.registered_commit_index {
+                if CORE_DETAILED_LOGS {
+                    println!(
+                        "S{} T{} PROCESS_LINEARIZABLE_READ: Key '{}'. Registered commit_idx: {}, Current last_applied: {}. Ready to process.",
+                        self.id, self.current_term, read_op.key, read_op.registered_commit_index, current_last_applied_for_reads
+                    );
+                }
+
+                let value = self.kv_store.get(&read_op.key).cloned();
+                let client_reply = ClientReply::Value { key: read_op.key.clone(), value };
+
+                if let Some(sender) = read_op.reply_channel.take() {
+                    if sender.send(client_reply).is_err() {
+                        if CORE_DETAILED_LOGS {
+                            println!(
+                                "S{} T{} PROCESS_LINEARIZABLE_READ_WARN: Client for key '{}' (reg_idx {}) disconnected or channel closed before reply could be sent.",
+                                self.id, self.current_term, read_op.key, read_op.registered_commit_index
+                            );
+                        }
+                    }
+                } else {
+                    if CORE_DETAILED_LOGS {
+                        eprintln!(
+                            "S{} T{} PROCESS_LINEARIZABLE_READ_ERROR: Reply channel for key '{}' was already taken or None.",
+                            self.id, self.current_term, read_op.key
+                        );
+                    }
+                }
+                reads_processed_this_cycle += 1;
+                false 
+            } else {
+                true 
+            }
+        });
+
+            if reads_processed_this_cycle > 0 && CORE_DETAILED_LOGS {
+                println!(
+                    "S{} T{} PROCESS_LINEARIZABLE_READ_CYCLE_DONE: Processed {} reads. {} still pending.",
+                    self.id,
+                    self.current_term,
+                    reads_processed_this_cycle,
+                    self.pending_reads.len()
+                );
+            }
+        } else {
+            if !self.pending_reads.is_empty() {
+                if CORE_DETAILED_LOGS {
+                    println!(
+                        "S{} T{} NOT_LEADER_FAIL_PENDING_READS: No longer leader. Failing {} pending read operations.",
+                        self.id,
+                        self.current_term,
+                        self.pending_reads.len()
+                    );
+                }
+                for mut read_op in self.pending_reads.drain(..) {
+                    if let Some(sender) = read_op.reply_channel.take() {
+                        let _ = sender.send(ClientReply::Error {
+                            msg: "Leader changed or stepped down during read processing.".to_string(),
+                        });
+                    }
+                }
+            }
+        }
 
         if self.should_snapshot() {
+            if CORE_DETAILED_LOGS {
+                println!(
+                    "S{} T{} SNAPSHOT_TRIGGER: last_applied ({}) - last_snapshot_index ({}) > threshold.",
+                    self.id, self.current_term, self.last_applied, self.last_snapshot_index
+                );
+            }
             let _ = self.take_snapshot();
         }
 
         if CORE_DETAILED_LOGS && (self.last_applied > 0 || !self.kv_store.is_empty()) {
             println!(
-                "S{} T{} KV_STATE_AFTER_APPLY: KV store size {} after applying up to idx {}.",
+                "S{} T{} KV_STATE_AFTER_APPLY: KV store size {} after applying up to raft_idx {}.",
                 self.id,
                 self.current_term,
                 self.kv_store.len(),
@@ -1382,10 +1492,11 @@ impl Server {
                     "S{} T{} ELECTED_LEADER: With {} votes",
                     self.id,
                     self.current_term,
-                    self.votes_received.len()
+                    self.votes_received.len(),
                 );
 
                 self.state = NodeState::Leader;
+                self.current_leader_id = Some(self.id);
                 self.last_heartbeat = Instant::now();
 
                 let mut no_op_needed = true;
