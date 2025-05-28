@@ -151,7 +151,7 @@ const CORE_DETAILED_LOGS: bool = true;
 
 impl Server {
     pub fn new(id: u64, peer_ids: Vec<u64>, metadata_path: String, log_path: String) -> Self {
-        let election_timeout_base = Duration::from_millis(1000);
+        let election_timeout_base = Duration::from_millis(300);
         let initial_due_placeholder =
             Instant::now() + Self::randomized_election_timeout(election_timeout_base);
         let snapshot_path = format!("{}.snap", log_path);
@@ -168,7 +168,7 @@ impl Server {
             match_index: HashMap::new(),
             kv_store: HashMap::new(),
             election_timeout_due: initial_due_placeholder,
-            heartbeat_interval: Duration::from_millis(100),
+            heartbeat_interval: Duration::from_millis(50),
             last_heartbeat: Instant::now(),
             election_timeout_base,
             peer_ids,
